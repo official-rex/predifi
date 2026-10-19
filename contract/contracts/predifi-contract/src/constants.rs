@@ -159,24 +159,75 @@ pub const DEFAULT_GLOBAL_MIN_STAKE: i128 = 1;
 /// **Used for:** Initializing `Config::prediction_cooldown_seconds` during contract initialization.
 pub const DEFAULT_PREDICTION_COOLDOWN_SECONDS: u64 = 0;
 
-/// Maximum number of options/outcomes allowed in a single pool.
+/// Contract-level maximum number of outcomes allowed in a single pool.
 ///
 /// **Units:** Count (dimensionless)
-/// **Value:** 100 options
+/// **Value:** 100 outcomes
 ///
-/// **Rationale:** Each outcome requires storage entries and computational overhead during
-/// resolution. Limiting to 100 prevents excessive gas costs, storage bloat, and UX complexity.
-/// This supports large tournaments (e.g., 64-team brackets) while preventing unbounded complexity.
+/// **Benchmark evidence:** `create_pool` with 100 outcomes consumes ~685k CPU
+/// instructions (well under Soroban's 100M instruction transaction ceiling) and
+/// the outcome-stake vector adds only ~1.6 KB to the pool entry. Both metrics
+/// are reported by `benchmark_tests::test_resource_ceilings_at_limits`.
+///
+/// **Rationale:** Each outcome adds storage and resolution bookkeeping. A cap
+/// of 100 supports large tournaments (e.g. 64-team brackets) while keeping
+/// creation and resolution far below execution limits.
 ///
 /// **Impact of changes:**
-/// - Increasing this value (e.g., to 200) would allow larger tournaments but increase
-///   gas costs for pool creation and resolution, and may hit Soroban's storage limits.
-/// - Decreasing this value (e.g., to 32) would reduce complexity but prevent certain market types.
-/// - Affects storage layout: pools with >= 16 outcomes use batch storage (`OutStakes`) instead
-///   of individual keys for efficiency.
+/// - Increasing this value allows larger markets but grows the `OutStakes`
+///   vector and the per-transaction cost of creation.
+/// - Decreasing this value reduces complexity but prevents some market types.
 ///
-/// **Used for:** Validating `options_count` during pool creation (via `InvalidData` error).
-pub const MAX_OPTIONS_COUNT: u32 = 100;
+/// **Used for:** Validating `options_count` during pool creation
+/// (`MaxOutcomesExceeded`).
+pub const MAX_OUTCOMES_PER_POOL: u32 = 100;
+
+/// Backwards-compatible alias for the outcome ceiling.
+///
+/// Kept so existing callers/tests that reference `MAX_OPTIONS_COUNT` continue
+/// to compile and observe the same limit.
+pub const MAX_OPTIONS_COUNT: u32 = MAX_OUTCOMES_PER_POOL;
+
+/// Contract-level maximum number of distinct predictors in a single pool.
+///
+/// **Units:** Count (dimensionless)
+/// **Value:** 1,000 predictions
+///
+/// **Benchmark evidence:** Each new predictor adds 320 XDR bytes of
+/// persistent state, so a pool at the cap holds ~321 KB of prediction data
+/// including the pool entry. The 1,000th prediction measures ~29.9M CPU
+/// instructions and ~15.4 MB of memory (the first prediction is ~0.7M CPU),
+/// leaving roughly 3.3x CPU headroom under Soroban's 100M instruction limit
+/// and 2.6x memory headroom under the 40 MB test budget. See
+/// `benchmark_tests::test_resource_ceilings_at_limits`.
+///
+/// **Rationale:** This bounds per-pool storage growth while still supporting
+/// high-volume markets. Repeated stake increases from an existing predictor
+/// do not consume another slot.
+///
+/// **Used for:** Validating `pool.participants_count` before a new prediction
+/// is written (`MaxPredictionsPerPoolExceeded`).
+pub const MAX_PREDICTIONS_PER_POOL: u32 = 1_000;
+
+/// Contract-level maximum aggregate stake for a single pool, in token base units.
+///
+/// **Units:** Token base units (stroops for native XLM)
+/// **Value:** 1,000,000,000,000,000,000 base units
+/// **Equivalent:** 100,000,000,000 tokens at 7 decimal places
+///
+/// **Benchmark evidence / safety derivation:** Aggregate stake arithmetic is
+/// O(1), so the binding constraint is overflow-safe proportional payout math.
+/// The hot payout path multiplies `user_stake * payout_pool`; with both bounded
+/// by this cap the worst-case product is `1e18 * 1e18 = 1e36`, which is below
+/// `i128::MAX` (~1.70e38) with ~170x headroom. All additions use
+/// `checked_add`, so a value that would overflow is rejected as
+/// `MaxAggregateStakeExceeded` before any write. The boundary tests cover
+/// `MAX_AGGREGATE_STAKE_PER_POOL - 1`, the cap itself, the cap + 1, and an
+/// overflowing addition.
+///
+/// **Used for:** Enforcing the protocol-wide aggregate stake ceiling in
+/// `place_prediction`, `create_pool`, and `increase_max_total_stake`.
+pub const MAX_AGGREGATE_STAKE_PER_POOL: i128 = 1_000_000_000_000_000_000;
 
 /// Maximum initial liquidity that can be provided (100M tokens at 7 decimals).
 ///
@@ -490,6 +541,33 @@ pub const FEE_CHANGE_TIMELOCK_SECONDS: u64 = 86_400;
 // **Used for:** Documenting and validating payout math in `claim_winnings`,
 // `claim_winnings_batch`, and the resolution/escrow accounting paths.
 
+/// Fee schedule version reported for legacy pools created before per-pool fee
+/// snapshots existed. Such pools have no stored `FeeSchedule` and settle against
+/// the live schedule at resolution, exactly as they did before the upgrade.
+pub const LEGACY_FEE_SCHEDULE_VERSION: u32 = 0;
+
+/// Number of decimals in the canonical fixed-point price representation.
+///
+/// Every stored feed price, confidence and `PriceCondition.target_price` is an
+/// integer number of `10^-PRICE_DECIMALS` units (i.e. exponent `-8`, the
+/// common Pyth USD exponent). `1.00 USD` is stored as `100_000_000`.
+pub const PRICE_DECIMALS: u32 = 8;
+
+/// Smallest provider exponent accepted by `update_price_feed_with_expo`.
+pub const MIN_PRICE_EXPONENT: i32 = -18;
+
+/// Largest provider exponent accepted by `update_price_feed_with_expo`.
+pub const MAX_PRICE_EXPONENT: i32 = 18;
+
+/// Maximum resolution challenge window: 7 days in seconds.
+///
+/// Bounds how long payouts can be held back after resolution while
+/// participants may still dispute the result.
+pub const MAX_CHALLENGE_WINDOW: u64 = 604_800;
+
+/// Maximum byte length of a challenge `evidence_uri`.
+pub const MAX_EVIDENCE_URI_LEN: u32 = 512;
+
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants)]
 mod tests {
@@ -518,8 +596,30 @@ mod tests {
     #[test]
     fn test_max_options_is_reasonable() {
         // Max options should be between 2 and 1000
-        assert!(MAX_OPTIONS_COUNT >= 2);
-        assert!(MAX_OPTIONS_COUNT <= 1000);
+        assert!(MAX_OUTCOMES_PER_POOL >= 2);
+        assert!(MAX_OUTCOMES_PER_POOL <= 1000);
+        assert_eq!(MAX_OPTIONS_COUNT, MAX_OUTCOMES_PER_POOL);
+    }
+
+    #[test]
+    fn test_resource_limit_relationships() {
+        // The aggregate cap exceeds the maximum initial liquidity so a pool
+        // can always seed itself and still accept user stakes.
+        assert!(MAX_AGGREGATE_STAKE_PER_POOL > MAX_INITIAL_LIQUIDITY);
+        // The prediction cap must leave room for the pool creator plus users.
+        assert!(MAX_PREDICTIONS_PER_POOL > 1);
+    }
+
+    #[test]
+    fn test_aggregate_stake_keeps_payout_product_overflow_safe() {
+        // The proportional payout path computes user_stake * payout_pool.
+        // Keeping both operands below sqrt(i128::MAX) guarantees that product
+        // cannot overflow before the division by winning_stake.
+        assert!(
+            MAX_AGGREGATE_STAKE_PER_POOL
+                <= i128::MAX / MAX_AGGREGATE_STAKE_PER_POOL,
+            "aggregate cap must leave room for overflow-safe payout products"
+        );
     }
 
     #[test]

@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "targets": {
+    "backend": {
+      "canaryPercent": 10,
+      "observationWindowSeconds": 300,
+      "success": {
+        "minHealthSuccessRate": 0.99,
+        "maxErrorRate": 0.01,
+        "maxP95LatencyMs": 2000
+      },
+      "autoStop": true
+    },
+    "frontend": {
+      "canaryPercent": 10,
+      "observationWindowSeconds": 300,
+      "success": {
+        "minHealthSuccessRate": 0.99,
+        "maxErrorRate": 0.02,
+        "maxP95LatencyMs": 3000
+      },
+      "autoStop": true
+    }
+  },
+  "manualOverride": {
+    "allowed": true,
+    "requireReason": true,
+    "auditField": "overrideReason"
+  }
+}

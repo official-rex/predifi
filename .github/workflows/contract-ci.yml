@@ -22,6 +22,14 @@ concurrency:
   group: contract-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Issue #137 — required for Sigstore-attested WASM artifacts.
+# `id-token: write` lets the workflow request a short-lived OIDC token to
+# sign the artifact; `attestations: write` lets it publish the attestation.
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
 env:
   CARGO_TERM_COLOR: always
   WASM_SIZE_THRESHOLD_KB: 200
@@ -114,6 +122,35 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+  test-fuzz:
+    name: cargo test (fuzz, bounded)
+    runs-on: ubuntu-latest
+    # Bounded fuzz budget: PROPTEST_CASES=256 at ~8ms/case ≈ 2s per test × 12
+    # tests ≈ 30s wallclock + cargo build ≈ 3-5min. 10-minute ceiling leaves
+    # headroom. If a contract change makes individual cases slow, this job
+    # must NOT silently time out — it should fail visibly.
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ./contract
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          enableCrossOsArchive: true
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contract/target
+          key: ${{ runner.os }}-contract-fuzz-${{ hashFiles('contract/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-contract-fuzz-
+      - name: cargo test (price_feed_proptests, bounded)
+        env:
+          PROPTEST_CASES: "256"
+        run: cargo test -p predifi-contract --lib price_feed_proptests
+
   wasm-build:
     name: WASM build verification
     runs-on: ubuntu-latest
@@ -160,6 +197,13 @@ jobs:
               exit 1
             fi
           done
+      - name: Attest WASM build provenance (Sigstore)
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            contract/target/wasm32-unknown-unknown/release/predifi_contract-optimized.wasm
+            contract/target/wasm32-unknown-unknown/release/access_control-optimized.wasm
+
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -173,7 +217,7 @@ jobs:
           retention-days: 14
 
   deploy-testnet:
-    name: Deploy to testnet
+    name: Deploy to testnet (verified)
     needs: [check, fmt, clippy, test, wasm-build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
@@ -184,6 +228,44 @@ jobs:
     environment: testnet
     steps:
       - uses: actions/checkout@v4
+
+      # ── Issue #137: download the SAME artifact that wasm-build signed ──
+      - name: Download attested WASM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: contract-wasm-${{ github.sha }}
+          path: contract/target/wasm32-unknown-unknown/release
+
+      # ── Issue #137: verify signature + source revision BEFORE deploying ──
+      - name: Verify WASM attestation (fail closed)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for WASM in \
+            target/wasm32-unknown-unknown/release/predifi_contract-optimized.wasm \
+            target/wasm32-unknown-unknown/release/access_control-optimized.wasm; do
+            echo "Verifying ${WASM}..."
+            gh attestation verify "${WASM}" \
+              --repo "${{ github.repository }}" \
+              --signer-workflow "${{ github.repository }}/.github/workflows/contract-ci.yml" \
+              --source-digest "${{ github.sha }}" \
+              --source-ref "refs/heads/develop"
+          done
+          echo "::notice::All WASM artifacts verified against ${{ github.sha }}"
+
+      # ── Issue #137: record the verified digest for audit ──
+      - name: Record verified digests
+        run: |
+          set -euo pipefail
+          for WASM in \
+            target/wasm32-unknown-unknown/release/predifi_contract-optimized.wasm \
+            target/wasm32-unknown-unknown/release/access_control-optimized.wasm; do
+            DIGEST=$(sha256sum "${WASM}" | awk '{print $1}')
+            echo "::notice::Verified ${WASM} sha256:${DIGEST}"
+            echo "| ${WASM} | sha256:${DIGEST} |" >> $GITHUB_STEP_SUMMARY
+          done
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -207,9 +289,57 @@ jobs:
           stellar network add testnet \
             --rpc-url https://soroban-testnet.stellar.org:443 \
             --network-passphrase "Test SDF Network ; September 2015" || true
-      - name: Build and deploy
+      # ── Deploy the verified WASM (does NOT rebuild — deploys what was signed) ──
+      - name: Deploy verified WASM to testnet
         run: |
           chmod +x scripts/deploy.sh
           ./scripts/deploy.sh testnet ci-deploy
         env:
           STELLAR_NETWORK: testnet
+
+  # ── Issue #137: staging tampered-artifact verification test ──
+  attestation-test:
+    name: Attestation fail-closed test
+    needs: [wasm-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download signed WASM
+        uses: actions/download-artifact@v4
+        with:
+          name: contract-wasm-${{ github.sha }}
+          path: wasm
+
+      - name: Verify untouched artifact PASSES
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh attestation verify wasm/predifi_contract-optimized.wasm \
+            --repo "${{ github.repository }}" \
+            --signer-workflow "${{ github.repository }}/.github/workflows/contract-ci.yml" \
+            --source-digest "${{ github.sha }}"
+          echo "Untampered artifact verified."
+
+      - name: Verify TAMPERED artifact FAILS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cp wasm/predifi_contract-optimized.wasm wasm/tampered.wasm
+          printf '\x00' >> wasm/tampered.wasm
+          if gh attestation verify wasm/tampered.wasm \
+               --repo "${{ github.repository }}" \
+               --signer-workflow "${{ github.repository }}/.github/workflows/contract-ci.yml" \
+               --source-digest "${{ github.sha }}" 2>/dev/null; then
+            echo "::error::Tampered artifact PASSED verification — fail-closed is broken!"
+            exit 1
+          fi
+          echo "Tampered artifact correctly REJECTED."
+

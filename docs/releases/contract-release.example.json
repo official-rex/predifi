@@ -1,0 +1,106 @@
+{
+  "format_version": 1,
+  "example_only": true,
+  "version": "0.1.0-rc.1",
+  "source": {
+    "repository": "https://github.com/Onipinsaiye/predifi",
+    "tag": "contracts-v0.1.0-rc.1",
+    "commit": "1111111111111111111111111111111111111111",
+    "note": "Synthetic tag and commit; not resolved Git objects."
+  },
+  "build": {
+    "method": "Offline byte fixture, not a Rust/Soroban build",
+    "lockfile_sha256": null,
+    "toolchain": null,
+    "note": "No build/reproducibility or deployment claim. Real releases require recorded toolchain, lockfile and commands."
+  },
+  "artifacts": [
+    {
+      "id": "access-control",
+      "crate": "access-control",
+      "filename": "access_control.wasm",
+      "fixture_wasm_hex": "0061736d0100000000020161",
+      "sha256": "ad7e07012b3bc61e217e1dddbba916d27799bc198c2f1d066a4562dd22513734",
+      "uploaded_wasm_hash": "ad7e07012b3bc61e217e1dddbba916d27799bc198c2f1d066a4562dd22513734",
+      "storage_schema_version": 1,
+      "readable_storage_schemas": [
+        1
+      ],
+      "migration": null,
+      "rollback": "Only to an artifact verified to read schema 1; no state rollback implied."
+    },
+    {
+      "id": "predifi-contract",
+      "crate": "predifi-contract",
+      "filename": "predifi_contract.wasm",
+      "fixture_wasm_hex": "0061736d0100000000020162",
+      "sha256": "76b54c92ad4dfa455958ee8b52624104db89ac16996be1aebaf8d85e4ddad6d7",
+      "uploaded_wasm_hash": "76b54c92ad4dfa455958ee8b52624104db89ac16996be1aebaf8d85e4ddad6d7",
+      "storage_schema_version": 1,
+      "readable_storage_schemas": [
+        1
+      ],
+      "migration": null,
+      "rollback": "Only to an artifact verified to read schema 1; no state rollback implied."
+    }
+  ],
+  "clients": [
+    {
+      "id": "fixture-frontend",
+      "revision": "fixture-client-1",
+      "supported_contract_versions": [
+        "0.1.0-rc.1"
+      ],
+      "tested_contract_version": "0.1.0-rc.1",
+      "evidence": "Offline mapping check only; not a real frontend test"
+    },
+    {
+      "id": "fixture-indexer",
+      "revision": "fixture-client-1",
+      "supported_contract_versions": [
+        "0.1.0-rc.1"
+      ],
+      "tested_contract_version": "0.1.0-rc.1",
+      "evidence": "Offline mapping check only; not a real indexer test"
+    }
+  ],
+  "external_sdk_support": "not tested",
+  "deployments": [
+    {
+      "record_id": "fixture-deployment-1",
+      "status": "synthetic-confirmed",
+      "release_tag": "contracts-v0.1.0-rc.1",
+      "source_commit": "1111111111111111111111111111111111111111",
+      "artifact_id": "access-control",
+      "network_passphrase": "PrediFi offline fixture network; NOT a live network",
+      "contract_address": "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526",
+      "transaction_hash": "6a5da3c55a564fb503d0daa6a242818d62659aff0ed0e26a6c8c0d8c65a9c5e2",
+      "ledger": 101,
+      "timestamp": "2026-10-18T00:00:00Z",
+      "observed_wasm_hash": "ad7e07012b3bc61e217e1dddbba916d27799bc198c2f1d066a4562dd22513734",
+      "storage_schema_version": 1,
+      "upgrade_counter": null,
+      "initialization": {
+        "admin": "fixture-admin; not a signing account"
+      }
+    },
+    {
+      "record_id": "fixture-deployment-2",
+      "status": "synthetic-confirmed",
+      "release_tag": "contracts-v0.1.0-rc.1",
+      "source_commit": "1111111111111111111111111111111111111111",
+      "artifact_id": "predifi-contract",
+      "network_passphrase": "PrediFi offline fixture network; NOT a live network",
+      "contract_address": "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ",
+      "transaction_hash": "e1d06b61c0115154760ac393a77240cc1d3f5a368c0aecc51602f83e7e27f5c4",
+      "ledger": 102,
+      "timestamp": "2026-10-18T00:00:00Z",
+      "observed_wasm_hash": "76b54c92ad4dfa455958ee8b52624104db89ac16996be1aebaf8d85e4ddad6d7",
+      "storage_schema_version": 1,
+      "upgrade_counter": 1,
+      "initialization": {
+        "access_control": "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526"
+      }
+    }
+  ]
+}

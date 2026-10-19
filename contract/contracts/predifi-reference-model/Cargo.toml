@@ -1,0 +1,16 @@
+[package]
+name    = "predifi-reference-model"
+version = "0.1.0"
+edition = "2021"
+description = "Off-chain reference model for PrediFi pool state machine and payout arithmetic. Used for differential testing against the Soroban contract."
+publish = false
+
+[lib]
+# Plain Rust library — no WASM, no Soroban SDK dependency.
+crate-type = ["lib"]
+
+[dependencies]
+# No Soroban or heavy dependencies. The model is pure Rust std.
+
+[dev-dependencies]
+proptest = { workspace = true }

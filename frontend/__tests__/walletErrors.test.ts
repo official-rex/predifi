@@ -49,6 +49,23 @@ describe("walletErrors", () => {
       expect(result.code).toBe("INSUFFICIENT_BALANCE");
     });
 
+    it("maps a stale Stellar sequence (`tx_bad_seq`) to STALE_SEQUENCE", () => {
+      const err = {
+        message: "Transaction submission failed",
+        extras: { result_codes: { transaction: "tx_bad_seq" } },
+      };
+      const result = classifyWalletError(err);
+      expect(result.code).toBe("STALE_SEQUENCE");
+      expect(result.title).toBe("Account sequence out of date");
+    });
+
+    it("detects a bad sequence reported only by message text", () => {
+      const result = classifyWalletError(
+        new Error("Transaction failed: bad sequence number"),
+      );
+      expect(result.code).toBe("STALE_SEQUENCE");
+    });
+
     it("falls through to a generic UNKNOWN error for an unrecognized error", () => {
       const err = new Error("Something went sideways");
       const result = classifyWalletError(err);

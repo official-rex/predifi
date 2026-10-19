@@ -19,9 +19,10 @@ Each file is named:
   the migration's numeric version and applies migrations in ascending version
   order.
 - `<description>` is a short, snake_case summary of what the migration does.
-- Migrations in this project are plain "up" scripts (no matching `.down.sql`
-  file) — there is no supported rollback path, so undoing a change requires a
-  new forward migration.
+- Migrations in this project are plain "up" scripts (no separate `.down.sql`
+  file). Detailed rollback SQL scripts and forward-fix recovery procedures for
+  each migration are documented in the [Migration Deployment Guide](../../docs/MIGRATION_DEPLOYMENT_GUIDE.md)
+  and programmatically accessible via `predifi_backend::migration_checks::get_known_migration_catalog()`.
 
 When adding a new migration, use the **next unused integer**, run
 `sqlx migrate add <description>` (or create the file by hand) inside this
@@ -63,22 +64,24 @@ details before assuming a fresh `sqlx migrate run` (or a fresh
 `predifi-seed` run, or the server's own startup migration) will succeed
 against a database that has never had any migrations applied to it.
 
-## Migration files
+## Migration files & safety classification
 
-| File | Adds |
-| :--- | :--- |
-| `001_create_referrals.sql` | `referrals` table indexing on-chain referral events (a user who staked via a referrer link). |
-| `002_create_pools.sql` | `pools` table indexing on-chain prediction pool data from the Stellar/Soroban contract. |
-| `003_create_predictions.sql` | `predictions` table indexing individual user stakes on a pool outcome. |
-| `004_creator_incentives_templates_and_indexes.sql` | Creator incentive columns + `creator_stats` on pools (#1366), pool templates for recurring markets (#1368), and extra lookup/sort indexes (#1369/#1370). |
-| `004_enhance_schema_precision.sql` | Converts stake/amount columns to `NUMERIC(32, 7)`, adds `contract_id` to `pools`, creates a `stats` table, and adds performance indexes (#706). |
-| `005_add_index_pools_created_at.sql` | Index on `pools.created_at` to speed up sorting by creation time. |
-| `006_optimize_user_address_indexes.sql` | Indexes on user-address columns for prediction-history and referral lookups. |
-| `007_optimize_pool_id_indexes.sql` | Indexes on `pool_id` columns for referral earnings and pool-scoped analytics. |
-| `008_referrer_stats.sql` | Pre-aggregated `referrer_stats`, maintained by trigger, to avoid full-table scans on referral volume reads. |
-| `009_add_predictions_indexes.sql` | Targeted indexes on `predictions` for query patterns not yet covered by an index. |
-| `009_create_user_statistics.sql` | Pre-aggregated `user_statistics` table, maintained by triggers, for user betting volume/winnings/prediction counts. |
-| `010_tags_claims_notifications.sql` | Multi-tag support on pools, claim tracking, and a notification system. |
+For full deployment guidelines, rollback SQL scripts, and interrupted migration recovery procedures, see the [Migration Deployment Guide](../../docs/MIGRATION_DEPLOYMENT_GUIDE.md).
+
+| File | Adds | Lock Level | Data Impact | Safe Online? |
+| :--- | :--- | :--- | :--- | :---: |
+| `001_create_referrals.sql` | `referrals` table indexing on-chain referral events (a user who staked via a referrer link). | `AccessExclusive` | `MetadataOnly` | **Yes** |
+| `002_create_pools.sql` | `pools` table indexing on-chain prediction pool data from the Stellar/Soroban contract. | `AccessExclusive` | `MetadataOnly` | **Yes** |
+| `003_create_predictions.sql` | `predictions` table indexing individual user stakes on a pool outcome. | `AccessExclusive` | `MetadataOnly` | **Yes** |
+| `004_creator_incentives_templates_and_indexes.sql` | Creator incentive columns + `creator_stats` on pools (#1366), pool templates for recurring markets (#1368), and extra lookup/sort indexes (#1369/#1370). | `Share` | `IndexBuild` | **No** on large tables |
+| `004_enhance_schema_precision.sql` | Converts stake/amount columns to `NUMERIC(32, 7)`, adds `contract_id` to `pools`, creates a `stats` table, and adds performance indexes (#706). | `AccessExclusive` | `FullTableRewrite` | **No** (maint window) |
+| `005_add_index_pools_created_at.sql` | Index on `pools.created_at` to speed up sorting by creation time. | `Share` | `IndexBuild` | **No** on high-write |
+| `006_optimize_user_address_indexes.sql` | Indexes on user-address columns for prediction-history and referral lookups. | `Share` | `IndexBuild` | **No** on large tables |
+| `007_optimize_pool_id_indexes.sql` | Indexes on `pool_id` columns for referral earnings and pool-scoped analytics. | `Share` | `IndexBuild` | **Yes** |
+| `008_referrer_stats.sql` | Pre-aggregated `referrer_stats`, maintained by trigger, to avoid full-table scans on referral volume reads. | `AccessExclusive` / `RowExclusive` | `DataBackfill` | **No** on large tables |
+| `009_add_predictions_indexes.sql` | Targeted indexes on `predictions` for query patterns not yet covered by an index. | `Share` | `IndexBuild` | **No** on large tables |
+| `009_create_user_statistics.sql` | Pre-aggregated `user_statistics` table, maintained by triggers, for user betting volume/winnings/prediction counts. | `AccessExclusive` / `RowExclusive` | `DataBackfill` | **No** on large tables |
+| `010_tags_claims_notifications.sql` | Multi-tag support on pools, claim tracking, and a notification system. | `AccessExclusive` / `Share` | `IndexBuild` | **Yes** |
 
 All 12 files above exist in this directory today.
 

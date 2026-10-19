@@ -555,7 +555,8 @@ pub async fn create_pool_template(
         .await
 }
 
-/// List all templates owned by `creator`, newest first.
+/// List a creator's templates, newest first (at most
+/// [`crate::constants::MAX_TEMPLATES_PER_LIST`]).
 pub async fn list_pool_templates(
     pool: &PgPool,
     creator: &str,
@@ -566,11 +567,13 @@ pub async fn list_pool_templates(
         FROM pool_templates
         WHERE creator = $1
         ORDER BY created_at DESC
+        LIMIT $2
         "#
     );
 
     sqlx::query_as::<_, PoolTemplate>(&sql)
         .bind(creator)
+        .bind(crate::constants::MAX_TEMPLATES_PER_LIST)
         .fetch_all(pool)
         .await
 }

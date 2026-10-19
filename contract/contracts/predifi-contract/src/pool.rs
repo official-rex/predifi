@@ -11,8 +11,16 @@ use crate::{
     PoolStats, PredifiContract, PredifiContractArgs, PredifiContractClient, PredifiError,
     ResolutionConflictEvent, ResolutionVoteCastEvent, StakeLimitsUpdatedEvent, StakingClosedEvent,
     CANCELATION_DELAY, DEFAULT_MIN_POOL_DURATION, EMERGENCY_CANCEL_MULTISIG_THRESHOLD,
-    INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS, MAX_INITIAL_LIQUIDITY, MAX_OPTIONS_COUNT,
-    MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
+    INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS, MAX_AGGREGATE_STAKE_PER_POOL, MAX_INITIAL_LIQUIDITY,
+    MAX_OUTCOMES_PER_POOL, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
+    Config, DataKey, FeeSchedule, FeeScheduleSnapshotEvent, InitialLiquidityProvidedEvent,
+    MarketState, MaxTotalStakeIncreasedEvent, Pool, PoolCanceledEvent, PoolConfig,
+    PoolCreatedEvent, PoolDescriptionUpdatedEvent, PoolDisputedEvent, PoolReadyForResolutionEvent,
+    PoolResolvedDiagEvent, PoolResolvedEvent, PoolStats, PredifiContract, PredifiContractArgs,
+    PredifiContractClient, PredifiError, ResolutionConflictEvent, ResolutionVoteCastEvent,
+    StakeLimitsUpdatedEvent, StakingClosedEvent, CANCELATION_DELAY, DEFAULT_MIN_POOL_DURATION,
+    EMERGENCY_CANCEL_MULTISIG_THRESHOLD, INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS,
+    MAX_INITIAL_LIQUIDITY, MAX_OPTIONS_COUNT, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
 };
 
 #[contractimpl]
@@ -36,7 +44,7 @@ impl PredifiContract {
     ///   pool duration, and no later than `MAX_POOL_DURATION` from the current ledger time.
     /// - `token` - The Stellar token contract address used for staking. It must be whitelisted;
     ///   the token contract itself is called only when a stake or initial liquidity is transferred.
-    /// - `options_count` - Number of possible outcomes (must be >= 2 and <= MAX_OPTIONS_COUNT = 100)
+    /// - `options_count` - Number of possible outcomes (must be >= 2 and <= MAX_OUTCOMES_PER_POOL = 100)
     /// - `category` - Market category symbol (e.g., `CATEGORY_SPORTS`, `CATEGORY_FINANCE`)
     /// - `config` - Pool configuration parameters via `PoolConfig` struct:
     ///   - `start_time` - Unix timestamp when the pool opens for predictions (0 = open immediately)
@@ -95,7 +103,8 @@ impl PredifiContract {
     /// The function returns or raises the following typed protocol errors:
     ///
     /// - `ContractPaused` - The contract is currently paused; all state-mutating operations are blocked
-    /// - `InvalidData` - `options_count` is less than 2 or greater than `MAX_OPTIONS_COUNT`.
+    /// - `InvalidData` - `options_count` is less than 2.
+    /// - `MaxOutcomesExceeded` - `options_count` is greater than `MAX_OUTCOMES_PER_POOL`.
     /// - `TokenNotWhitelisted` - The specified token is not on the allowed betting whitelist
     /// - `InvalidTimestamp` - `end_time` is not in the future, exceeds MAX_POOL_DURATION, or `end_time <= start_time`
     /// - `DeadlineInPast` - `end_time` or `start_time` is in the past (issue #1130)
@@ -130,7 +139,7 @@ impl PredifiContract {
     ///
     /// **Outcome Validation:**
     /// - `options_count` must be >= 2 (binary or multi-outcome)
-    /// - `options_count` must be <= MAX_OPTIONS_COUNT (100)
+    /// - `options_count` must be <= MAX_OUTCOMES_PER_POOL (100)
     /// - `outcome_descriptions` length must equal `options_count`
     /// - Each outcome description must be between 1 and 128 bytes
     ///
@@ -343,9 +352,10 @@ impl PredifiContract {
             return Err(PredifiError::InvalidData);
         }
 
-        // Validate: options_count must not exceed maximum limit
-        if options_count > MAX_OPTIONS_COUNT {
-            return Err(PredifiError::InvalidData);
+        // Validate: options_count must not exceed the contract-level outcome ceiling.
+        // This is enforced before the pool id is read or any storage is written.
+        if options_count > MAX_OUTCOMES_PER_POOL {
+            return Err(PredifiError::MaxOutcomesExceeded);
         }
 
         // Validate: initial_liquidity must be non-negative if provided
@@ -359,6 +369,12 @@ impl PredifiContract {
             config.initial_liquidity <= MAX_INITIAL_LIQUIDITY,
             "initial_liquidity exceeds maximum allowed value"
         );
+
+        // Validate: initial liquidity must fit under the contract-level
+        // aggregate stake ceiling so the pool cannot start over-cap.
+        if config.initial_liquidity > MAX_AGGREGATE_STAKE_PER_POOL {
+            soroban_sdk::panic_with_error!(&env, PredifiError::MaxAggregateStakeExceeded);
+        }
 
         // Issue #1131 — initial-liquidity safety margin. When the creator
         // caps the pool at `max_total_stake > 0`, the seeded liquidity must
@@ -439,6 +455,13 @@ impl PredifiContract {
         );
         assert!(config.max_total_stake >= 0, "max_total_stake must be >= 0");
 
+        // Validate: a per-pool cap cannot exceed the contract-level ceiling.
+        // Zero remains the "no per-pool cap" sentinel; the global ceiling still
+        // applies to every prediction.
+        if config.max_total_stake > MAX_AGGREGATE_STAKE_PER_POOL {
+            soroban_sdk::panic_with_error!(&env, PredifiError::MaxAggregateStakeExceeded);
+        }
+
         if let Some(ref whitelist_key) = config.whitelist_key {
             if let Err(e) = Self::validate_referral_code(&env, whitelist_key) {
                 soroban_sdk::panic_with_error!(&env, e);
@@ -485,6 +508,19 @@ impl PredifiContract {
         let pool_key = DataKey::Pool(pool_id);
         env.storage().persistent().set(&pool_key, &pool);
         Self::bump_ttl(&env, &pool_key);
+
+        // Snapshot the fee schedule so later treasury changes cannot alter
+        // this pool's economics at settlement.
+        let fee_schedule = FeeSchedule {
+            version: Self::current_fee_schedule_version(&env),
+            base_fee_bps: pool.fee_bps,
+            tiers: Self::get_fee_tiers(env.clone()),
+        };
+        let fee_schedule_key = DataKey::PoolFeeSchedule(pool_id);
+        env.storage()
+            .persistent()
+            .set(&fee_schedule_key, &fee_schedule);
+        Self::bump_ttl(&env, &fee_schedule_key);
 
         // Initialize optimized batch storage with zeros to avoid expensive fallback reads
         let initial_stakes = gas_opt::alloc_zero_stakes(&env, options_count);
@@ -538,6 +574,14 @@ impl PredifiContract {
             required_resolutions: config.required_resolutions,
             max_total_stake: config.max_total_stake,
             outcome_descriptions: config.outcome_descriptions,
+        }
+        .publish(&env);
+
+        FeeScheduleSnapshotEvent {
+            pool_id,
+            version: fee_schedule.version,
+            base_fee_bps: fee_schedule.base_fee_bps,
+            tiers_count: fee_schedule.tiers.len(),
         }
         .publish(&env);
 
@@ -598,6 +642,11 @@ impl PredifiContract {
             new_max_total_stake == 0 || new_max_total_stake >= pool.total_stake,
             "new_max_total_stake must be zero (unlimited) or >= total_stake"
         );
+
+        // A per-pool cap may not exceed the contract-level aggregate ceiling.
+        if new_max_total_stake > MAX_AGGREGATE_STAKE_PER_POOL {
+            return Err(PredifiError::MaxAggregateStakeExceeded);
+        }
 
         // Only allow increasing the cap (or setting unlimited)
         if pool.max_total_stake > 0 && new_max_total_stake > 0 {
@@ -758,10 +807,13 @@ impl PredifiContract {
     ///    - `pool.state` is set to `MarketState::Resolved`.
     ///    - `pool.outcome` is recorded.
     ///    - A dynamic protocol fee (`pool.fee_bps`) is calculated via
-    ///      [`Self::calculate_dynamic_fee`].
+    ///      [`Self::calculate_dynamic_fee`] from the pool's creation-time
+    ///      [`FeeSchedule`] snapshot.
     ///    - `pool.resolution_timestamp` is stamped with the current ledger time.
     ///    - The pool is removed from the global active index.
     ///    - [`PoolResolvedEvent`] and [`PoolResolvedDiagEvent`] are published.
+    ///    - If a challenge window is configured, payouts stay blocked until the
+    ///      resolution is final (see `challenge_resolution` / `finalize_resolution`).
     ///
     /// # Oracle and price-feed relationship
     ///
@@ -975,7 +1027,7 @@ impl PredifiContract {
         if new_outcome_votes >= pool.required_resolutions {
             pool.state = MarketState::Resolved;
             pool.outcome = outcome;
-            pool.fee_bps = Self::calculate_dynamic_fee(&env, &pool);
+            pool.fee_bps = Self::calculate_dynamic_fee(&env, pool_id, &pool);
             pool.resolution_timestamp = Some(env.ledger().timestamp()); // Record resolution time
 
             env.storage().persistent().set(&pool_key, &pool);
@@ -983,6 +1035,7 @@ impl PredifiContract {
             // Remove from global active index now that the pool is resolved.
             Self::remove_from_active_index(&env, pool_id);
             Self::bump_ttl(&env, &pool_key);
+            Self::open_challenge_window(&env, pool_id, outcome);
 
             // Retrieve winning-outcome stake for the diagnostic event efficiently
             let winning_stake = Self::get_outcome_stake(env.clone(), pool_id, outcome);
@@ -1390,6 +1443,17 @@ impl PredifiContract {
             .expect("Pool not found");
         Self::extend_persistent(&env, &pool_key);
         pool
+    }
+
+    /// Returns the fee schedule snapshotted when the pool was created.
+    ///
+    /// `None` for legacy pools created before snapshots existed (version
+    /// [`crate::LEGACY_FEE_SCHEDULE_VERSION`]); those settle against the live
+    /// schedule at resolution.
+    pub fn get_pool_fee_schedule(env: Env, pool_id: u64) -> Option<FeeSchedule> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PoolFeeSchedule(pool_id))
     }
 
     /// Returns the configuration fields of a pool as a `PoolConfig` struct.

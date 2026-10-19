@@ -175,6 +175,64 @@ pub const DEFAULT_PAGE_LIMIT: i64 = 20;
 /// **Used for:** Clamping the `limit` query parameter on list endpoints.
 pub const MAX_PAGE_LIMIT: i64 = 100;
 
+/// Largest `offset` accepted on paginated list endpoints.
+///
+/// **Units:** Items (count).
+/// **Value:** 10,000 items (page 100 at the maximum page size).
+///
+/// **Rationale:** Postgres must walk past every skipped row for `OFFSET n`, so
+/// an unbounded offset lets one request force a huge scan. It also keeps the
+/// `offset + rank` arithmetic in the leaderboards far away from `i64::MAX`.
+///
+/// **Impact of changes:**
+/// - Raising it lets clients page deeper at a higher worst-case query cost.
+/// - Lowering it limits deep paging; clients should use cursors or filters.
+///
+/// **Used for:** The `offset` query parameter on list endpoints.
+pub const MAX_PAGE_OFFSET: i64 = 10_000;
+
+// ── Request body limits ──────────────────────────────────────────────────────
+
+/// Maximum JSON body size, in bytes, for each write endpoint. Axum's default
+/// is 2 MiB, far more than any of these payloads legitimately needs.
+///
+/// **Units:** Bytes.
+///
+/// **Used for:** `DefaultBodyLimit` layers in `routes/v1.rs`.
+pub const MAX_BODY_BYTES_TOKEN_REFRESH: usize = 4 * 1024;
+pub const MAX_BODY_BYTES_ADMIN: usize = 1024;
+pub const MAX_BODY_BYTES_INDEXER_EVENT: usize = 4 * 1024;
+pub const MAX_BODY_BYTES_POOL_CREATED: usize = 16 * 1024;
+pub const MAX_BODY_BYTES_TAGS: usize = 4 * 1024;
+pub const MAX_BODY_BYTES_INTERESTS: usize = 4 * 1024;
+pub const MAX_BODY_BYTES_NOTIFICATIONS_READ: usize = 8 * 1024;
+pub const MAX_BODY_BYTES_POOL_TEMPLATE: usize = 8 * 1024;
+
+// ── Request payload limits ───────────────────────────────────────────────────
+
+/// Maximum number of tags on one pool, and in one `?tags=` filter.
+pub const MAX_TAGS_PER_POOL: usize = 10;
+/// Maximum length of a single tag, in characters.
+pub const MAX_TAG_LEN: usize = 32;
+/// Maximum number of interests a user can follow.
+pub const MAX_INTERESTS_PER_USER: usize = 20;
+/// Maximum length of a single interest, in characters.
+pub const MAX_INTEREST_LEN: usize = 64;
+/// Maximum number of notification ids in one mark-as-read request.
+pub const MAX_NOTIFICATION_IDS: usize = 100;
+/// Maximum length, in characters, of a pool template's short text fields
+/// (`name`, `category` and `token`).
+pub const MAX_TEMPLATE_TEXT_LEN: usize = 128;
+/// Maximum length, in characters, of a pool template's `description`.
+pub const MAX_TEMPLATE_DESCRIPTION_LEN: usize = 1_000;
+/// Length of a Stellar address (`G…` / `C…`), the longest valid `creator`.
+pub const MAX_ADDRESS_LEN: usize = 56;
+/// Largest `duration_seconds` / `recurrence_interval_seconds` on a pool
+/// template (10 years). Also keeps `now + interval` far from overflow.
+pub const MAX_TEMPLATE_SECONDS: i64 = 10 * 365 * 24 * 3_600;
+/// Maximum number of templates returned by one `GET /pool-templates` request.
+pub const MAX_TEMPLATES_PER_LIST: i64 = 100;
+
 // ── JWT validation ────────────────────────────────────────────────────────────
 
 /// Number of dot-separated parts a well-formed JWT must have (header.payload.signature).
@@ -386,5 +444,27 @@ mod tests {
     #[test]
     fn jwt_parts_count_is_three() {
         assert_eq!(JWT_PARTS_COUNT, 3);
+    }
+
+    #[test]
+    fn page_offset_cap_is_at_least_one_max_page() {
+        assert!(MAX_PAGE_OFFSET >= MAX_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn body_limits_are_positive_and_below_axum_default() {
+        let axum_default = 2 * 1024 * 1024;
+        for limit in [
+            MAX_BODY_BYTES_TOKEN_REFRESH,
+            MAX_BODY_BYTES_ADMIN,
+            MAX_BODY_BYTES_INDEXER_EVENT,
+            MAX_BODY_BYTES_POOL_CREATED,
+            MAX_BODY_BYTES_TAGS,
+            MAX_BODY_BYTES_INTERESTS,
+            MAX_BODY_BYTES_NOTIFICATIONS_READ,
+            MAX_BODY_BYTES_POOL_TEMPLATE,
+        ] {
+            assert!(limit > 0 && limit < axum_default);
+        }
     }
 }

@@ -4,15 +4,15 @@
 //! is resolved, their claim window is about to expire, and when new pools
 //! matching their interests are created.
 //!
-//! Delivery is sweep-based ([`run_notification_sweep`]) rather than wired
-//! into every individual event-ingestion path: it's simpler, and the unique
-//! `(user_address, pool_id, notif_type)` index on `notifications` makes every
-//! insert idempotent, so the sweep can run on a fixed interval (see
-//! `server.rs`) without ever double-notifying a user.
+//! Delivery uses a transactional outbox: notification intents are written to
+//! `notification_outbox` in the same transaction as the domain mutation that
+//! triggers them, then a background worker claims, delivers, and retries them.
+//! This guarantees that rolled-back domain writes emit no notification and
+//! that committed writes eventually deliver exactly once (logically).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use tracing::{info, instrument, warn};
 
 /// How far ahead of `end_time` a pool counts as "ending soon".
@@ -21,6 +21,10 @@ const POOL_ENDING_SOON_WINDOW: &str = "1 hour";
 const CLAIM_EXPIRING_WINDOW: &str = "1 day";
 /// How far back to scan for newly created pools when matching interests.
 const NEW_POOL_LOOKBACK: &str = "1 day";
+/// Maximum delivery attempts before an outbox row is marked terminally failed.
+const MAX_DELIVERY_ATTEMPTS: i32 = 5;
+/// How long a claimed outbox row is leased before another worker may reclaim it.
+const CLAIM_LEASE_SECONDS: i64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifType {
@@ -80,6 +84,158 @@ async fn create_notification(
     .await?;
 
     Ok(())
+}
+
+/// Write a notification intent into the transactional outbox using the caller's
+/// transaction. The intent is only visible to the delivery worker once the
+/// surrounding domain transaction commits; a rollback discards it entirely.
+pub async fn enqueue_notification(
+    tx: &mut Transaction<'_, Postgres>,
+    user_address: &str,
+    notif_type: NotifType,
+    title: &str,
+    message: &str,
+    pool_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO notification_outbox
+            (user_address, notif_type, title, message, pool_id)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (user_address, pool_id, notif_type) DO NOTHING
+        "#,
+    )
+    .bind(user_address)
+    .bind(notif_type.as_str())
+    .bind(title)
+    .bind(message)
+    .bind(pool_id)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+/// A claimed outbox row awaiting delivery.
+#[derive(Debug, Clone, FromRow)]
+pub struct OutboxRow {
+    pub id: i64,
+    pub user_address: String,
+    pub notif_type: String,
+    pub title: String,
+    pub message: String,
+    pub pool_id: i64,
+    pub attempts: i32,
+}
+
+/// Claim up to `limit` pending outbox rows for delivery, leasing them so that
+/// concurrent workers do not process the same row. Rows whose lease has expired
+/// (e.g. after a process crash) become claimable again.
+#[instrument(skip(pool), name = "notifications.claim_outbox")]
+pub async fn claim_outbox(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<OutboxRow>, sqlx::Error> {
+    let rows: Vec<OutboxRow> = sqlx::query_as(&format!(
+        r#"
+        UPDATE notification_outbox
+        SET status = 'processing',
+            attempts = attempts + 1,
+            claimed_at = NOW(),
+            updated_at = NOW()
+        WHERE id IN (
+            SELECT id FROM notification_outbox
+            WHERE status = 'pending'
+               OR (status = 'processing'
+                   AND claimed_at < NOW() - INTERVAL '{CLAIM_LEASE_SECONDS} seconds')
+            ORDER BY id
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING id, user_address, notif_type, title, message, pool_id, attempts
+        "#
+    ))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Mark a claimed outbox row as successfully delivered.
+pub async fn mark_delivered(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE notification_outbox SET status = 'delivered', updated_at = NOW() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Record a failed delivery attempt. Rows that exceed [`MAX_DELIVERY_ATTEMPTS`]
+/// transition to the terminal `failed` state; others return to `pending` for a
+/// later retry.
+pub async fn mark_failed(pool: &PgPool, id: i64, error: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE notification_outbox
+        SET status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'pending' END,
+            last_error = $3,
+            claimed_at = NULL,
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(MAX_DELIVERY_ATTEMPTS)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Deliver a single claimed outbox row by inserting it into `notifications`.
+/// The unique `(user_address, pool_id, notif_type)` index makes this idempotent,
+/// so a redelivery after a crash never double-notifies a user.
+async fn deliver_outbox_row(pool: &PgPool, row: &OutboxRow) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO notifications (user_address, notif_type, title, message, pool_id)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (user_address, pool_id, notif_type) DO NOTHING
+        "#,
+    )
+    .bind(&row.user_address)
+    .bind(&row.notif_type)
+    .bind(&row.title)
+    .bind(&row.message)
+    .bind(row.pool_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Claim and deliver pending outbox rows. Returns the number of rows delivered.
+#[instrument(skip(pool), name = "notifications.process_outbox")]
+pub async fn process_outbox(pool: &PgPool, limit: i64) -> Result<usize, sqlx::Error> {
+    let rows = claim_outbox(pool, limit).await?;
+    let mut delivered = 0usize;
+
+    for row in &rows {
+        match deliver_outbox_row(pool, row).await {
+            Ok(()) => {
+                mark_delivered(pool, row.id).await?;
+                delivered += 1;
+            }
+            Err(error) => {
+                warn!(outbox_id = row.id, error = %error, "notification delivery failed");
+                mark_failed(pool, row.id, &error.to_string()).await?;
+            }
+        }
+    }
+
+    Ok(delivered)
 }
 
 /// List `address`'s notifications, newest first.
@@ -237,8 +393,9 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
         .await?;
 
         for u in &users {
-            create_notification(
-                pool,
+            let mut tx = pool.begin().await?;
+            enqueue_notification(
+                &mut tx,
                 &u.user_address,
                 NotifType::PoolEndingSoon,
                 "Pool ending soon",
@@ -246,6 +403,7 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
                 p.pool_id,
             )
             .await?;
+            tx.commit().await?;
             summary.pools_ending_soon += 1;
         }
     }
@@ -266,8 +424,9 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
         .await?;
 
         for u in &users {
-            create_notification(
-                pool,
+            let mut tx = pool.begin().await?;
+            enqueue_notification(
+                &mut tx,
                 &u.user_address,
                 NotifType::PoolResolved,
                 "Pool resolved",
@@ -275,6 +434,7 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
                 p.pool_id,
             )
             .await?;
+            tx.commit().await?;
             summary.pools_resolved += 1;
         }
     }
@@ -309,8 +469,9 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
         .await?;
 
         for u in &winners {
-            create_notification(
-                pool,
+            let mut tx = pool.begin().await?;
+            enqueue_notification(
+                &mut tx,
                 &u.user_address,
                 NotifType::ClaimExpiring,
                 "Claim window closing soon",
@@ -318,6 +479,7 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
                 p.pool_id,
             )
             .await?;
+            tx.commit().await?;
             summary.claims_expiring += 1;
         }
     }
@@ -351,8 +513,9 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
         .await?;
 
         for u in &matched_users {
-            create_notification(
-                pool,
+            let mut tx = pool.begin().await?;
+            enqueue_notification(
+                &mut tx,
                 &u.user_address,
                 NotifType::NewPoolMatch,
                 "New pool matching your interests",
@@ -360,6 +523,7 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
                 p.pool_id,
             )
             .await?;
+            tx.commit().await?;
             summary.new_pool_matches += 1;
         }
     }
@@ -373,6 +537,18 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
     );
 
     Ok(summary)
+}
+
+/// Run the outbox delivery worker on a fixed interval until the process exits.
+/// Errors are logged and skipped rather than aborting the loop.
+pub async fn run_outbox_loop(pool: PgPool, interval: std::time::Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        ticker.tick().await;
+        if let Err(error) = process_outbox(&pool, 100).await {
+            warn!(error = %error, "notification outbox processing failed");
+        }
+    }
 }
 
 /// Run [`run_notification_sweep`] on a fixed interval until the process exits.

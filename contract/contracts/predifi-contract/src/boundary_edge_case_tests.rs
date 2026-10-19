@@ -15,8 +15,8 @@
 extern crate std;
 
 use crate::{
-    FEE_CHANGE_TIMELOCK_SECONDS,
-    MarketState, PoolConfig, PredifiContract, PredifiContractClient, PredifiError,
+    FEE_CHANGE_TIMELOCK_SECONDS, MAX_AGGREGATE_STAKE_PER_POOL, MarketState, PoolConfig,
+    PredifiContract, PredifiContractClient, PredifiError,
 };
 use soroban_sdk::{
     symbol_short,
@@ -3527,23 +3527,26 @@ fn create_capped_pool(ctx: &TestEnv, max_total_stake: i128, end_offset: u64) -> 
     )
 }
 
-/// Increasing max_total_stake to i128::MAX must succeed without arithmetic
-/// overflow, and the cap must be stored exactly.
+/// Increasing max_total_stake to the contract aggregate ceiling must succeed
+/// without arithmetic overflow, and the cap must be stored exactly.
 #[test]
-fn test_1525_increase_max_total_stake_to_i128_max() {
+fn test_1525_increase_max_total_stake_to_contract_ceiling() {
     let env = Env::default();
     let ctx = TestEnv::new(&env);
 
     let pool_id = create_capped_pool(&ctx, 1_000i128, 7_200);
 
-    ctx.client
-        .increase_max_total_stake(&ctx.creator, &pool_id, &i128::MAX);
+    ctx.client.increase_max_total_stake(
+        &ctx.creator,
+        &pool_id,
+        &MAX_AGGREGATE_STAKE_PER_POOL,
+    );
 
     let pool = ctx.client.get_pool(&pool_id);
     assert_eq!(
         pool.max_total_stake,
-        i128::MAX,
-        "max_total_stake must be i128::MAX after the call"
+        MAX_AGGREGATE_STAKE_PER_POOL,
+        "max_total_stake must equal the contract ceiling after the call"
     );
 }
 

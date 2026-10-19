@@ -2,7 +2,7 @@
  * Wallet connection error taxonomy and user-facing recovery helpers.
  *
  * Covers: network mismatch, missing extension, user rejection,
- * transaction timeout, and insufficient balance.
+ * transaction timeout, insufficient balance, and stale account sequence.
  */
 
 export type WalletErrorCode =
@@ -11,6 +11,7 @@ export type WalletErrorCode =
   | "USER_REJECTED"
   | "TRANSACTION_TIMEOUT"
   | "INSUFFICIENT_BALANCE"
+  | "STALE_SEQUENCE"
   | "UNKNOWN";
 
 export interface WalletError {
@@ -72,6 +73,13 @@ const WALLET_ERRORS: Record<
     recoveryAction:
       "Add funds to your wallet on the correct network, then try again.",
   },
+  STALE_SEQUENCE: {
+    title: "Account sequence out of date",
+    message:
+      "Your Stellar account's sequence number changed before this transaction was accepted — another transaction landed first.",
+    recoveryAction:
+      "PrediFi refreshed your account state. Rebuild and retry the action with the current sequence number.",
+  },
 };
 
 export function makeWalletError(
@@ -121,6 +129,65 @@ function extractMessage(err: unknown): string {
   return "";
 }
 
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Concatenate every field a Stellar/Soroban error might carry (result codes,
+ * nested `extras.result_codes`, message) into one lowercase-searchable string.
+ */
+function errorSearchText(err: unknown): string {
+  if (err == null) return "";
+  if (typeof err === "string") return err;
+  if (err instanceof Error) {
+    return `${err.message} ${safeStringify((err as { cause?: unknown }).cause)}`;
+  }
+  if (typeof err === "object") {
+    const e = err as Record<string, unknown>;
+    const parts: string[] = [];
+    if (typeof e.message === "string") parts.push(e.message);
+    if (typeof e.code === "string" || typeof e.code === "number") {
+      parts.push(String(e.code));
+    }
+    parts.push(safeStringify(e));
+    return parts.join(" ");
+  }
+  return String(err);
+}
+
+/** Stellar rejects a submission whose sequence is stale with `tx_bad_seq`. */
+const STALE_SEQUENCE_MARKERS = [
+  "tx_bad_seq",
+  "bad_seq",
+  "badseq",
+  "bad sequence",
+  "stale sequence",
+  "incorrect sequence",
+  "wrong sequence",
+  "sequence number",
+];
+
+/**
+ * Detect a stale / bad Stellar sequence-number rejection.
+ *
+ * Such a rejection is *definitive* — the network refused the whole transaction,
+ * so it did not apply and is safe to rebuild after refreshing account state.
+ */
+export function isStaleSequenceError(err: unknown): boolean {
+  const code = extractRawCode(err);
+  if (typeof code === "string") {
+    const c = code.toLowerCase();
+    if (c === "tx_bad_seq" || c === "bad_seq" || c === "txbadseq") return true;
+  }
+  const text = errorSearchText(err).toLowerCase();
+  return STALE_SEQUENCE_MARKERS.some((marker) => text.includes(marker));
+}
+
 /**
  * Map a raw wallet/provider error into a structured {@link WalletError}.
  */
@@ -164,6 +231,11 @@ export function classifyWalletError(err: unknown): WalletError {
     message.includes("unsupported network")
   ) {
     return makeWalletError("NETWORK_MISMATCH", err);
+  }
+
+  // Stale / bad account sequence (Stellar `tx_bad_seq`).
+  if (isStaleSequenceError(err)) {
+    return makeWalletError("STALE_SEQUENCE", err);
   }
 
   // Timeout

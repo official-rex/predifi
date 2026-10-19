@@ -5,6 +5,9 @@
 //! - Dead-letter queue (DLQ) for permanently failed jobs
 //! - Idempotent processing via a processed-job ID set
 //! - Worker health snapshots (last success, consecutive failures, DLQ depth)
+//! - Transactional outbox for notification intents: intents are written in the
+//!   same transaction as domain changes, then claimed, retried, and eventually
+//!   delivered (or terminally failed) by the worker.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use tracing::{error, info, warn};
 
 /// Default maximum delivery attempts before a job is dead-lettered.
@@ -24,6 +28,10 @@ pub const DEFAULT_MAX_DELAY_MS: u64 = 30_000;
 const DLQ_CAPACITY: usize = 1_000;
 /// Maximum retained processed job IDs for idempotency.
 const IDEMPOTENCY_CAPACITY: usize = 10_000;
+/// Default lease duration (ms) for a claimed outbox row before it is reclaimable.
+pub const DEFAULT_OUTBOX_LEASE_MS: u64 = 30_000;
+/// Default maximum delivery attempts for an outbox notification intent.
+pub const DEFAULT_OUTBOX_MAX_ATTEMPTS: u32 = 5;
 
 /// Retry policy with exponential backoff.
 #[derive(Debug, Clone, Copy)]
@@ -31,6 +39,17 @@ pub struct RetryPolicy {
     pub max_attempts: u32,
     pub base_delay_ms: u64,
     pub max_delay_ms: u64,
+}
+
+/// A notification intent row claimed from the transactional outbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboxIntent {
+    pub id: i64,
+    pub job_id: String,
+    pub kind: String,
+    pub payload: String,
+    pub attempts: u32,
+    pub ledger: Option<u64>,
 }
 
 impl Default for RetryPolicy {
@@ -383,6 +402,236 @@ impl JobQueue {
                         .consecutive_failures
                         .fetch_add(1, Ordering::Relaxed);
                 }
+            }
+        }
+    }
+}
+
+/// Transactional outbox for user notifications.
+///
+/// Intents are inserted via [`Outbox::enqueue_in_tx`] using the *same*
+/// transaction as the domain mutation, so a rolled-back domain write leaves no
+/// intent behind. A worker claims rows with `FOR UPDATE SKIP LOCKED`, retries
+/// transient delivery failures with backoff, and terminally fails rows that
+/// exhaust their attempts (mirroring the in-memory DLQ semantics).
+#[derive(Clone)]
+pub struct Outbox {
+    pool: PgPool,
+    policy: RetryPolicy,
+    lease_ms: u64,
+}
+
+impl Outbox {
+    pub fn new(pool: PgPool, policy: RetryPolicy, lease_ms: u64) -> Self {
+        Self {
+            pool,
+            policy,
+            lease_ms,
+        }
+    }
+
+    pub fn with_defaults(pool: PgPool) -> Self {
+        Self::new(pool, RetryPolicy::default(), DEFAULT_OUTBOX_LEASE_MS)
+    }
+
+    /// Insert a notification intent inside an existing domain transaction.
+    ///
+    /// If the caller rolls back the transaction, the intent is rolled back too,
+    /// guaranteeing no notification is emitted for an uncommitted state change.
+    pub async fn enqueue_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        job_id: &str,
+        kind: &str,
+        payload: &str,
+        ledger: Option<u64>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO notification_outbox (job_id, kind, payload, ledger, attempts, available_at)
+            VALUES ($1, $2, $3, $4, 0, NOW())
+            ON CONFLICT (job_id) DO NOTHING
+            "#,
+        )
+        .bind(job_id)
+        .bind(kind)
+        .bind(payload)
+        .bind(ledger.map(|l| l as i64))
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Claim up to `limit` ready intents, leasing them for `lease_ms`.
+    ///
+    /// Uses `FOR UPDATE SKIP LOCKED` so multiple workers can claim disjoint
+    /// batches without contention. Claimed rows are marked in-flight and will
+    /// be reclaimable once their lease expires (recovery after process failure).
+    pub async fn claim(&self, limit: i64) -> Result<Vec<OutboxIntent>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT id, job_id, kind, payload, attempts, ledger
+            FROM notification_outbox
+            WHERE status = 'pending'
+              AND available_at <= NOW()
+              AND (locked_until IS NULL OR locked_until < NOW())
+            ORDER BY id
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut claimed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = row.try_get("id")?;
+            sqlx::query(
+                r#"
+                UPDATE notification_outbox
+                SET status = 'in_flight',
+                    locked_until = NOW() + ($2::bigint * INTERVAL '1 millisecond')
+                WHERE id = $1
+                "#,
+            )
+            .bind(id)
+            .bind(self.lease_ms as i64)
+            .execute(&mut *tx)
+            .await?;
+
+            claimed.push(OutboxIntent {
+                id,
+                job_id: row.try_get("job_id")?,
+                kind: row.try_get("kind")?,
+                payload: row.try_get("payload")?,
+                attempts: row.try_get::<i32, _>("attempts")? as u32,
+                ledger: row.try_get::<Option<i64>, _>("ledger")?.map(|l| l as u64),
+            });
+        }
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    /// Mark an intent as successfully delivered (terminal success).
+    pub async fn mark_delivered(&self, id: i64) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE notification_outbox
+            SET status = 'delivered', delivered_at = NOW(), locked_until = NULL
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record a delivery failure: reschedule with backoff or terminally fail.
+    ///
+    /// Returns `true` if the intent was scheduled for retry, `false` if it was
+    /// terminally failed (exhausted attempts).
+    pub async fn record_failure(
+        &self,
+        intent: &OutboxIntent,
+        error: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let next_attempt = intent.attempts.saturating_add(1);
+        if self.policy.should_retry(next_attempt) {
+            let delay = self.policy.delay_before_attempt(next_attempt + 1);
+            sqlx::query(
+                r#"
+                UPDATE notification_outbox
+                SET status = 'pending',
+                    attempts = $2,
+                    last_error = $3,
+                    locked_until = NULL,
+                    available_at = NOW() + ($4::bigint * INTERVAL '1 millisecond')
+                WHERE id = $1
+                "#,
+            )
+            .bind(intent.id)
+            .bind(next_attempt as i32)
+            .bind(error)
+            .bind(delay.as_millis() as i64)
+            .execute(&self.pool)
+            .await?;
+            Ok(true)
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE notification_outbox
+                SET status = 'failed',
+                    attempts = $2,
+                    last_error = $3,
+                    locked_until = NULL,
+                    failed_at = NOW()
+                WHERE id = $1
+                "#,
+            )
+            .bind(intent.id)
+            .bind(next_attempt as i32)
+            .bind(error)
+            .execute(&self.pool)
+            .await?;
+            Ok(false)
+        }
+    }
+
+    /// Reclaim intents whose lease expired (process crashed mid-delivery).
+    pub async fn reclaim_expired(&self) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r#"
+            UPDATE notification_outbox
+            SET status = 'pending', locked_until = NULL
+            WHERE status = 'in_flight' AND locked_until < NOW()
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Process a single claimed intent with retry/terminal-failure semantics.
+    pub async fn deliver_with_retry<F, Fut>(
+        &self,
+        intent: OutboxIntent,
+        handler: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(OutboxIntent) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        match handler(intent.clone()).await {
+            Ok(()) => {
+                self.mark_delivered(intent.id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Err(e) => {
+                let retried = self
+                    .record_failure(&intent, &e)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if retried {
+                    warn!(
+                        outbox_id = intent.id,
+                        job_id = %intent.job_id,
+                        attempts = intent.attempts + 1,
+                        error = %e,
+                        "notification delivery failed; scheduled retry"
+                    );
+                } else {
+                    error!(
+                        outbox_id = intent.id,
+                        job_id = %intent.job_id,
+                        error = %e,
+                        "notification delivery exhausted retries; terminally failed"
+                    );
+                }
+                Err(e)
             }
         }
     }

@@ -17,6 +17,8 @@ mod gas_opt;
 mod oracle;
 #[cfg(test)]
 mod payout_proptests;
+#[cfg(test)]
+mod price_feed_proptests;
 mod payouts;
 mod pool;
 mod prediction;
@@ -40,6 +42,8 @@ mod stress_test_high_volume;
 mod test_utils;
 #[cfg(test)]
 mod pause_unpause_boundary_tests;
+#[cfg(test)]
+mod resource_limit_boundary_tests;
 // #[cfg(test)]
 // mod max_pools_stress_tests;
 #[cfg(test)]
@@ -47,6 +51,13 @@ mod update_pool_description_boundary_tests;
 #[cfg(test)]
 mod withdraw_treasury_boundary_tests;
 mod treasury;
+mod challenge;
+#[cfg(test)]
+mod fee_schedule_snapshot_tests;
+#[cfg(test)]
+mod oracle_price_units_confidence_tests;
+#[cfg(test)]
+mod resolution_challenge_tests;
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, token,
@@ -81,20 +92,22 @@ pub use safe_math::{RoundingMode, SafeMath};
 // │          │       │ withdraw_treasury                                     │
 // │          │       │ upgrade_contract                                      │
 // │          │       │ migrate_state                                         │
+// │          │       │ set_challenge_config                                  │
 // ├──────────┼───────┼──────────────────────────────────────────────────────┤
 // │ Operator │   1   │ resolve_pool (multi-vote; finalises when threshold    │
 // │          │       │   of required_resolutions is reached)                 │
 // │          │       │ cancel_pool                                           │
 // │          │       │ set_stake_limits                                      │
 // ├──────────┼───────┼──────────────────────────────────────────────────────┤
+// │ Moderator│   2   │ flag_disputed_pool                                    │
+// │          │       │ adjudicate_challenge (resolution challenge window)    │
+// ├──────────┼───────┼──────────────────────────────────────────────────────┤
 // │ Oracle   │   3   │ oracle_resolve (OracleCallback trait; multi-vote;     │
 // │          │       │   finalises when required_resolutions threshold met)  │
 // └──────────┴───────┴──────────────────────────────────────────────────────┘
 //
-// Note: roles 2 (Moderator) and 4 (User) are defined in the access-control
-// contract but are not currently enforced by predifi-contract.
-// Role 2 (Moderator) is RESERVED FOR FUTURE USE — it is intended for dispute
-// resolution functionality. See issue #595 for the implementation plan.
+// Note: role 4 (User) is defined in the access-control contract but is not
+// currently enforced by predifi-contract.
 //
 // HOW ROLES ARE ASSIGNED
 // ──────────────────────
@@ -226,6 +239,13 @@ pub enum PredifiError {
     InsufficientStake = 45,
     /// User has exceeded the maximum number of predictions allowed per pool.
     MaxPredictionsExceeded = 111,
+    /// A pool requested more outcomes than `MAX_OUTCOMES_PER_POOL`.
+    MaxOutcomesExceeded = 114,
+    /// A pool reached `MAX_PREDICTIONS_PER_POOL` distinct predictors.
+    MaxPredictionsPerPoolExceeded = 115,
+    /// Adding this stake would exceed `MAX_AGGREGATE_STAKE_PER_POOL`
+    /// (or the aggregate addition would overflow `i128`).
+    MaxAggregateStakeExceeded = 116,
     /// The fee basis points exceed the maximum allowed value (10000).
     InvalidFeeBps = 93,
     /// Metadata URL exceeds maximum length (512 bytes).
@@ -278,6 +298,15 @@ pub enum PredifiError {
     FeeChangePending = 95,
     NoFeeChangePending = 96,
     TimelockNotExpired = 97,
+    /// The provider price exponent is outside
+    /// `[MIN_PRICE_EXPONENT, MAX_PRICE_EXPONENT]`, or the value cannot be
+    /// represented in `PRICE_DECIMALS` fixed-point without becoming zero.
+    UnsupportedPriceExponent = 114,
+    /// The oracle confidence interval is too wide to resolve on: either
+    /// `confidence / price` exceeds the `min_confidence_ratio` policy, or the
+    /// interval crosses the price-condition boundary. Resolution is deferred
+    /// until a tighter price is published.
+    PriceConfidenceTooWide = 115,
 }
 
 /// Represents the current state of a prediction market.
@@ -309,7 +338,7 @@ pub struct CreatePoolParams {
     pub end_time: u64,
     /// The Stellar token contract address used for staking.
     pub token: Address,
-    /// Number of possible outcomes (must be >= 2 and <= MAX_OPTIONS_COUNT).
+    /// Number of possible outcomes (must be >= 2 and <= MAX_OUTCOMES_PER_POOL).
     pub options_count: u32,
     /// Short human-readable description of the event (max 256 bytes).
     pub description: String,
@@ -609,6 +638,79 @@ pub struct FeeTier {
     pub fee_bps: u32,
 }
 
+/// Fee schedule captured when a pool is created.
+///
+/// Settlement uses this snapshot instead of the live `Config.fee_bps` /
+/// `FeeTiers`, so a later `apply_fee_bps` or `set_fee_tiers` cannot change the
+/// economics of a pool that already exists. Read it with
+/// [`PredifiContract::get_pool_fee_schedule`].
+///
+/// Pools created before snapshots existed have no stored schedule
+/// (`get_pool_fee_schedule` returns `None`, version
+/// [`LEGACY_FEE_SCHEDULE_VERSION`]); they keep their original behaviour and
+/// are settled against the live schedule at resolution time.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeSchedule {
+    /// Protocol fee schedule version in force when the pool was created.
+    /// Starts at 1 and increments on every `apply_fee_bps` / `set_fee_tiers`.
+    pub version: u32,
+    /// Base protocol fee (bps) applied when no tier threshold is met.
+    pub base_fee_bps: u32,
+    /// Dynamic fee tiers in force when the pool was created.
+    pub tiers: Vec<FeeTier>,
+}
+
+/// Protocol-wide resolution challenge policy, set with
+/// [`PredifiContract::set_challenge_config`].
+///
+/// A `window_seconds` of 0 (the default) disables challenges: resolutions are
+/// final immediately, which is the pre-existing behaviour.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChallengeConfig {
+    /// Seconds after resolution during which a challenge may be filed.
+    /// Bounded by `MAX_CHALLENGE_WINDOW`.
+    pub window_seconds: u64,
+    /// Bond (in the pool's token base units) a challenger must post.
+    /// Must be > 0 whenever `window_seconds > 0`.
+    pub bond_amount: i128,
+}
+
+/// Lifecycle of a pool's resolution while its challenge window is active.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChallengeStatus {
+    /// Resolution recorded; challenges accepted until `deadline`.
+    Open = 0,
+    /// A challenge was filed; payouts are blocked until adjudication.
+    Challenged = 1,
+    /// Resolution is final; payouts are enabled.
+    Finalized = 2,
+}
+
+/// Per-pool resolution challenge record, created at resolution time when the
+/// challenge window is enabled. Read it with
+/// [`PredifiContract::get_resolution_challenge`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionChallenge {
+    /// Last timestamp (inclusive) at which a challenge may be filed.
+    pub deadline: u64,
+    /// Bond required to challenge, snapshotted from `ChallengeConfig`.
+    pub bond_amount: i128,
+    pub status: ChallengeStatus,
+    /// Outcome recorded by the oracle/operator resolution.
+    pub original_outcome: u32,
+    pub challenger: Option<Address>,
+    /// SHA-256 (or other 32-byte) commitment to the evidence bundle.
+    pub evidence_hash: Option<BytesN<32>>,
+    /// Location of the evidence bundle (e.g. IPFS URI), max 512 bytes.
+    pub evidence_uri: Option<String>,
+    /// Timestamp at which the record was marked `Finalized`.
+    pub finalized_at: Option<u64>,
+}
+
 /// Detailed information about a user's prediction in a specific pool.
 ///
 /// This struct is a convenient "read-only" view that combines user-specific prediction
@@ -787,6 +889,21 @@ pub enum DataKey {
     /// Sentinel that records a pool has been marked ready for resolution.
     /// `PoolReady(pool_id)` -> `bool`.
     PoolReady(u64),
+
+    // ── Fee schedule snapshots ───────────────────────────────────────────────
+    /// Current protocol fee schedule version: `FeeScheduleVersion` -> `u32`.
+    /// Absent means version 1.
+    FeeScheduleVersion,
+    /// Fee schedule captured at pool creation:
+    /// `PoolFeeSchedule(pool_id)` -> `FeeSchedule`. Absent for legacy pools.
+    PoolFeeSchedule(u64),
+
+    // ── Resolution challenge window ─────────────────────────────────────────
+    /// Protocol challenge policy: `ChallengeConfig` -> `ChallengeConfig`.
+    ChallengeConfig,
+    /// Per-pool challenge record:
+    /// `ResolutionChallenge(pool_id)` -> `ResolutionChallenge`.
+    ResolutionChallenge(u64),
 }
 
 /// Represents a user's individual stake in a prediction market.
@@ -1366,6 +1483,71 @@ pub struct ResolutionVoteCastEvent {
     pub outcome: u32,
     pub vote_count: u32,
     pub required_resolutions: u32,
+}
+
+/// Emitted by `create_pool` with the fee schedule snapshotted for the pool.
+#[contractevent(topics = ["fee_schedule_snapshot"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeScheduleSnapshotEvent {
+    pub pool_id: u64,
+    pub version: u32,
+    pub base_fee_bps: u32,
+    pub tiers_count: u32,
+}
+
+#[contractevent(topics = ["challenge_config_update"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChallengeConfigUpdateEvent {
+    pub admin: Address,
+    pub window_seconds: u64,
+    pub bond_amount: i128,
+}
+
+/// Emitted when a pool resolves while the challenge window is enabled.
+#[contractevent(topics = ["challenge_window_opened"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChallengeWindowOpenedEvent {
+    pub pool_id: u64,
+    pub outcome: u32,
+    pub deadline: u64,
+    pub bond_amount: i128,
+}
+
+#[contractevent(topics = ["resolution_challenged"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionChallengedEvent {
+    pub pool_id: u64,
+    pub challenger: Address,
+    pub bond_amount: i128,
+    pub evidence_hash: BytesN<32>,
+    pub evidence_uri: String,
+}
+
+#[contractevent(topics = ["challenge_adjudicated"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChallengeAdjudicatedEvent {
+    pub pool_id: u64,
+    pub moderator: Address,
+    pub upheld: bool,
+    pub original_outcome: u32,
+    pub final_outcome: u32,
+    /// Receives the bond: the challenger when upheld, the treasury otherwise.
+    pub bond_recipient: Address,
+}
+
+/// Emitted exactly once per pool when its resolution becomes final.
+#[contractevent(topics = ["resolution_finalized"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionFinalizedEvent {
+    pub pool_id: u64,
+    pub outcome: u32,
+    pub timestamp: u64,
 }
 mod events;
 use events::ClaimWindowUpdateEvent;
@@ -2143,16 +2325,28 @@ impl PredifiContract {
     /// taken from winners.
     ///
     /// Called by `resolve_pool` and `resolve_pool_from_price` immediately before the
-    /// pool's state is written as `Resolved`, so the fee is fixed at the moment of
-    /// resolution rather than at prediction time.
+    /// pool's state is written as `Resolved`. The tier is picked from the pool's
+    /// final stake, but the base fee and tiers come from the [`FeeSchedule`]
+    /// snapshotted at pool creation, so treasury configuration changes made after
+    /// creation never apply retroactively. Legacy pools without a snapshot fall
+    /// back to the live schedule (their pre-snapshot behaviour).
     ///
     /// # Returns
     /// A fee rate in basis points (0–10 000).  The caller is responsible for ensuring
     /// the returned value satisfies `is_valid_fee_bps`.
-    fn calculate_dynamic_fee(env: &Env, pool: &Pool) -> u32 {
-        let config = Self::get_config(env);
-        let tiers = Self::get_fee_tiers(env.clone());
-        let mut applied_fee = config.fee_bps;
+    fn calculate_dynamic_fee(env: &Env, pool_id: u64, pool: &Pool) -> u32 {
+        let (base_fee_bps, tiers) = match env
+            .storage()
+            .persistent()
+            .get::<DataKey, FeeSchedule>(&DataKey::PoolFeeSchedule(pool_id))
+        {
+            Some(schedule) => (schedule.base_fee_bps, schedule.tiers),
+            None => (
+                Self::get_config(env).fee_bps,
+                Self::get_fee_tiers(env.clone()),
+            ),
+        };
+        let mut applied_fee = base_fee_bps;
 
         let mut max_threshold = -1i128;
         for i in 0..tiers.len() {
@@ -2165,6 +2359,23 @@ impl PredifiContract {
             }
         }
         applied_fee
+    }
+
+    /// Current protocol fee schedule version (1 until the first change).
+    fn current_fee_schedule_version(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeScheduleVersion)
+            .unwrap_or(1)
+    }
+
+    /// Advance the fee schedule version. Called whenever the base fee or the
+    /// fee tiers change, so each snapshot identifies the schedule it captured.
+    fn bump_fee_schedule_version(env: &Env) {
+        let next = Self::current_fee_schedule_version(env).saturating_add(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeScheduleVersion, &next);
     }
 }
 
@@ -2181,4 +2392,3 @@ mod issues_1446_1447_1448_1449_boundary_tests;
 mod referral_integration_tests;
 #[cfg(test)]
 mod test;
-

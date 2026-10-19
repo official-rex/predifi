@@ -11,6 +11,7 @@ This directory contains comprehensive documentation for the PrediFi prediction m
 | Document | Description | Status |
 |----------|-------------|--------|
 | **[API_REFERENCE.md](./API_REFERENCE.md)** | Complete API reference with OpenAPI specification, authentication, rate limiting, and WebSocket subscriptions | Current |
+| **[MIGRATION_DEPLOYMENT_GUIDE.md](./MIGRATION_DEPLOYMENT_GUIDE.md)** | Database migration safety guide, lock classifications, rollback runbooks, and recovery procedures | Current |
 | **[OPENAPI_CLIENT_GENERATION.md](./OPENAPI_CLIENT_GENERATION.md)** | Guide for generating client SDKs in TypeScript, Python, and Rust | Current |
 | **[SMART_CONTRACT_DEPLOYMENT_GUIDE.md](./SMART_CONTRACT_DEPLOYMENT_GUIDE.md)** | Step-by-step guide for deploying PrediFi smart contracts to Stellar testnet and mainnet | Current |
 | **[quickstart.md](./quickstart.md)** | Quick start guide for developers | Current |
@@ -19,6 +20,7 @@ This directory contains comprehensive documentation for the PrediFi prediction m
 | **[troubleshooting.md](./troubleshooting.md)** | Common issues and solutions | Current |
 | **[prediction-lifecycle.md](./prediction-lifecycle.md)** | Prediction market lifecycle documentation | Current |
 | **[oracles.md](./oracles.md)** | Oracle integration documentation | Current |
+| **[resolution-challenge-window.md](./resolution-challenge-window.md)** | Post-resolution challenge window, bonds and state diagram | Current |
 | **[whitelist-events.md](./whitelist-events.md)** | Token whitelist events documentation | Current |
 | **[rate-limiting.md](./rate-limiting.md)** | Rate limiting configuration and behavior | Current |
 | **[glossary.md](./glossary.md)** | Terminology and definitions | Current |
@@ -165,6 +167,7 @@ docs/                                  # Documentation directory
 ├── troubleshooting.md                 # Common issues and solutions
 ├── prediction-lifecycle.md            # Prediction market lifecycle
 ├── oracles.md                         # Oracle integration
+├── resolution-challenge-window.md     # Resolution challenge window
 ├── whitelist-events.md                # Token whitelist events
 ├── rate-limiting.md                   # Rate limiting configuration
 ├── glossary.md                        # Terminology

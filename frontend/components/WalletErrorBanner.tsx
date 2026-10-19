@@ -1,6 +1,6 @@
 "use client";
 
-import { AlertTriangle, Wallet, XCircle, Clock, Coins, X } from "lucide-react";
+import { AlertTriangle, Wallet, XCircle, Clock, Coins, RefreshCw, X } from "lucide-react";
 import { Button } from "@/components/ui";
 import { cn } from "@/lib/utils";
 import type { WalletError, WalletErrorCode } from "@/lib/walletErrors";
@@ -11,6 +11,7 @@ const ICONS: Record<WalletErrorCode, typeof AlertTriangle> = {
   USER_REJECTED: XCircle,
   TRANSACTION_TIMEOUT: Clock,
   INSUFFICIENT_BALANCE: Coins,
+  STALE_SEQUENCE: RefreshCw,
   UNKNOWN: AlertTriangle,
 };
 

@@ -12,6 +12,7 @@
 mod pools;
 mod predictions;
 mod referrals;
+pub mod outbox;
 pub mod metrics;
 
 // ── Re-export every public item from each repository module ──────────────────
@@ -84,6 +85,18 @@ pub use referrals::{
     get_referral_earnings,
     insert_referral_from_event,
     insert_referrals_bulk,
+};
+
+pub use outbox::{
+    // Types
+    ClaimedNotification,
+    NotificationIntent,
+    NotificationOutboxRow,
+    // Outbox queries
+    claim_notification_intents,
+    enqueue_notification_intent,
+    mark_notification_failed,
+    mark_notification_sent,
 };
 
 use std::time::Duration;
@@ -331,5 +344,42 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.attempts, 1, "should fail after only one attempt for PoolClosed");
+    }
+
+    #[test]
+    fn notification_intent_is_constructed_with_pending_state() {
+        let intent = NotificationIntent::new(
+            "user-1",
+            "pool_resolved",
+            serde_json::json!({ "pool_id": "pool-1" }),
+        );
+        assert_eq!(intent.user_id, "user-1");
+        assert_eq!(intent.kind, "pool_resolved");
+        assert_eq!(intent.attempts, 0);
+    }
+
+    #[test]
+    fn notification_intent_serializes_payload() {
+        let intent = NotificationIntent::new(
+            "user-2",
+            "prediction_settled",
+            serde_json::json!({ "amount": 42 }),
+        );
+        let payload = intent.payload_json();
+        assert!(payload.contains("42"), "payload should be serialized JSON");
+    }
+
+    #[test]
+    fn claimed_notification_exposes_retry_budget() {
+        let claimed = ClaimedNotification {
+            id: 7,
+            user_id: "user-3".to_string(),
+            kind: "referral_paid".to_string(),
+            payload: serde_json::json!({}),
+            attempts: 2,
+            max_attempts: 5,
+        };
+        assert!(claimed.can_retry());
+        assert_eq!(claimed.remaining_attempts(), 3);
     }
 }

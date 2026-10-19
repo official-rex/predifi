@@ -1,0 +1,21 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "fix/issue-27-contracts-specify-deterministic-payout",
+    "fix/issue-67-backend-establish-latency-and-query-count",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "fix/issue-27-contracts-specify-deterministic-payout": "main",
+    "fix/issue-67-backend-establish-latency-and-query-count": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "fix/issue-27-contracts-specify-deterministic-payout",
+    "fix/issue-67-backend-establish-latency-and-query-count",
+    "origin"
+  ]
+}

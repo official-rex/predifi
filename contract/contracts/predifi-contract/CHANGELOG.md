@@ -9,11 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### ABI
 
+- Added contract-level ceilings for pool outcomes (`MAX_OUTCOMES_PER_POOL`),
+  distinct predictors per pool (`MAX_PREDICTIONS_PER_POOL`), and aggregate
+  stake (`MAX_AGGREGATE_STAKE_PER_POOL`).
+
 ### Error Codes
+
+- Added `MaxOutcomesExceeded` (114), `MaxPredictionsPerPoolExceeded` (115),
+  and `MaxAggregateStakeExceeded` (116).
 
 ### Events
 
 ### Internal
+
+- Enforced all three resource limits before any prediction or pool state is
+  written, with overflow-safe aggregate stake accounting.
+- Added boundary tests at maximum, maximum-minus-one, and maximum-plus-one,
+  plus resource benchmarks covering CPU, memory, and persistent storage.
 
 ## [0.0.0] - 2026-09-17
 

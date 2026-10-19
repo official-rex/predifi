@@ -57,7 +57,8 @@ use crate::{
     MarketState, OutcomeStakesUpdatedEvent, PayoutInput, Pool, Prediction,
     PredictionBlockedDelistedEvent, PredictionPlacedEvent, PredifiContract, PredifiContractArgs,
     PredifiContractClient, PredifiError, ReferralPaidEvent, RefundClaimedEvent, RewardClaimedEvent,
-    SuspiciousDoubleClaimEvent, UserPredictionDetail, WinningsClaimedEvent, HIGH_VALUE_THRESHOLD,
+    SuspiciousDoubleClaimEvent, UserPredictionDetail, WinningsClaimedEvent,
+    HIGH_VALUE_THRESHOLD, MAX_AGGREGATE_STAKE_PER_POOL, MAX_PREDICTIONS_PER_POOL,
 };
 
 #[contractimpl]
@@ -110,6 +111,16 @@ impl PredifiContract {
     /// **Total Pool Cap:**
     /// - If `pool.max_total_stake > 0`, the new `pool.total_stake + amount` must not exceed this cap
     /// - Error: `MaxTotalStakeExceeded`
+    ///
+    /// **Contract Aggregate Ceiling:**
+    /// - `pool.total_stake + amount` must not exceed `MAX_AGGREGATE_STAKE_PER_POOL`
+    /// - The addition uses `checked_add`, so an `i128` overflow is rejected too
+    /// - Error: `MaxAggregateStakeExceeded`
+    ///
+    /// **Per-Pool Prediction Count Limit:**
+    /// - A new predictor is rejected once `pool.participants_count` reaches
+    ///   `MAX_PREDICTIONS_PER_POOL`
+    /// - Error: `MaxPredictionsPerPoolExceeded`
     ///
     /// **User Prediction Count Limit:**
     /// - If `Config::max_predictions_per_user > 0`, a user cannot place predictions on more than
@@ -195,6 +206,8 @@ impl PredifiContract {
     /// - `StakeBelowMinimum` - The amount is below the pool's `min_stake`
     /// - `StakeAboveMaximum` - The amount exceeds the pool's `max_stake` (if > 0)
     /// - `MaxTotalStakeExceeded` - Adding this amount would exceed `pool.max_total_stake`
+    /// - `MaxAggregateStakeExceeded` - Adding this amount would exceed the contract ceiling or overflow `i128`
+    /// - `MaxPredictionsPerPoolExceeded` - The pool already has `MAX_PREDICTIONS_PER_POOL` distinct predictors
     /// - `RateLimitOrSuspiciousActivity` - The prediction cooldown period has not elapsed
     /// - `MaxPredictionsExceeded` - The user has exceeded the maximum number of pools they can participate in
     /// - `ArithmeticError` - An overflow occurred during stake calculations
@@ -209,6 +222,8 @@ impl PredifiContract {
     /// - `env.ledger().timestamp() < pool.end_time` (pool has not ended)
     /// - `pool.min_stake <= amount <= pool.max_stake` (unless `max_stake == 0`)
     /// - `amount >= Config::min_stake` (global minimum)
+    /// - `pool.total_stake + amount <= MAX_AGGREGATE_STAKE_PER_POOL`
+    /// - `pool.participants_count < MAX_PREDICTIONS_PER_POOL` for a new predictor
     /// - `outcome < pool.options_count`
     /// - Pool's token must be whitelisted
     /// - For private pools: user must be whitelisted, be the creator, or provide valid `invite_key`
@@ -339,13 +354,35 @@ impl PredifiContract {
             soroban_sdk::panic_with_error!(&env, PredifiError::StakeAboveMaximum);
         }
 
-        // Enforce global pool cap (max total stake)
-        if pool.max_total_stake > 0 {
-            let new_total = pool.total_stake.checked_add(amount).expect("overflow");
-            if new_total > pool.max_total_stake {
+        // Enforce the contract-level aggregate stake ceiling and the optional
+        // per-pool cap before writing any prediction or pool state. The
+        // addition is checked so an `i128` overflow is surfaced as a typed
+        // contract error rather than a host panic.
+        let new_total_stake = match pool.total_stake.checked_add(amount) {
+            Some(total) => total,
+            None => {
                 Self::exit_reentrancy_guard(&env);
-                soroban_sdk::panic_with_error!(&env, PredifiError::MaxTotalStakeExceeded);
+                soroban_sdk::panic_with_error!(&env, PredifiError::MaxAggregateStakeExceeded);
             }
+        };
+        if new_total_stake > MAX_AGGREGATE_STAKE_PER_POOL {
+            Self::exit_reentrancy_guard(&env);
+            soroban_sdk::panic_with_error!(&env, PredifiError::MaxAggregateStakeExceeded);
+        }
+        if pool.max_total_stake > 0 && new_total_stake > pool.max_total_stake {
+            Self::exit_reentrancy_guard(&env);
+            soroban_sdk::panic_with_error!(&env, PredifiError::MaxTotalStakeExceeded);
+        }
+
+        // Enforce the contract-level cap on distinct predictors before any
+        // cooldown TTL update or prediction state write. Only a first-time
+        // prediction consumes a slot; increasing an existing stake does not
+        // add persistent per-pool state.
+        let pred_key = DataKey::Pred(user.clone(), pool_id);
+        let existing_pred = env.storage().persistent().get::<_, Prediction>(&pred_key);
+        if existing_pred.is_none() && pool.participants_count >= MAX_PREDICTIONS_PER_POOL {
+            Self::exit_reentrancy_guard(&env);
+            soroban_sdk::panic_with_error!(&env, PredifiError::MaxPredictionsPerPoolExceeded);
         }
 
         let config = Self::get_config(&env);
@@ -397,8 +434,6 @@ impl PredifiContract {
             // as it's the same prediction, not a new pool participation
         }
 
-        let pred_key = DataKey::Pred(user.clone(), pool_id);
-        let existing_pred = env.storage().persistent().get::<_, Prediction>(&pred_key);
         if let Some(mut existing_pred) = existing_pred {
             assert!(
                 existing_pred.outcome == outcome,
@@ -458,7 +493,7 @@ impl PredifiContract {
         }
 
         // Update total stake (INV-1)
-        pool.total_stake = pool.total_stake.checked_add(amount).expect("overflow");
+        pool.total_stake = new_total_stake;
         env.storage().persistent().set(&pool_key, &pool);
         Self::bump_ttl(&env, &pool_key);
 
@@ -545,6 +580,14 @@ impl PredifiContract {
                 return Err(PredifiError::PoolNotResolved);
             }
 
+            // Challenge-window gate, checked before `Claimed` is written so a
+            // blocked claim (e.g. inside `batch_claim_winnings`) stays claimable.
+            let final_since = if pool.state == MarketState::Resolved {
+                Self::resolution_final_since(env, pool_id)?
+            } else {
+                None
+            };
+
             let claimed_key = DataKey::Claimed(user.clone(), pool_id);
             if env.storage().persistent().has(&claimed_key) {
                 SuspiciousDoubleClaimEvent {
@@ -606,8 +649,9 @@ impl PredifiContract {
                 return Err(PredifiError::PoolNotResolved);
             }
 
-            // Check claim window expiration if resolution timestamp exists
-            if let Some(resolution_timestamp) = pool.resolution_timestamp {
+            // Check claim window expiration. The window opens when the
+            // resolution became final (after any challenge window).
+            if let Some(resolution_timestamp) = final_since.or(pool.resolution_timestamp) {
                 let config = Self::get_config(env);
                 let claim_deadline = resolution_timestamp
                     .checked_add(config.claim_window_seconds)

@@ -9,11 +9,14 @@ mod benchmark_tests {
 
     extern crate std;
 
-    use crate::{DataKey, Pool, PoolConfig, PredifiContract, PredifiContractClient};
+    use crate::{
+        DataKey, Pool, PoolConfig, PredifiContract, PredifiContractClient, Prediction,
+        MAX_AGGREGATE_STAKE_PER_POOL, MAX_OUTCOMES_PER_POOL, MAX_PREDICTIONS_PER_POOL,
+    };
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Ledger},
-        token, Address, Env, String, Vec, xdr,
+        token, xdr::ToXdr, Address, Env, String, Vec,
     };
 
     mod dummy_access_control {
@@ -307,7 +310,9 @@ mod benchmark_tests {
         );
 
         let mut tracked_users: std::vec::Vec<Address> = std::vec::Vec::new();
-        let bytes_at_creation = measure_pool_footprint(&env, pool_id, &tracked_users);
+        let contract_id = client.address.clone();
+        let bytes_at_creation =
+            measure_pool_footprint(&env, &contract_id, pool_id, &tracked_users);
         std::println!(
             "[storage] bytes_per_pool at creation = {}",
             bytes_at_creation
@@ -324,7 +329,8 @@ mod benchmark_tests {
                 .place_prediction(&user, &pool_id, &100, &(i % options_count), &None, &None);
             tracked_users.push(user);
 
-            let bytes_after = measure_pool_footprint(&env, pool_id, &tracked_users);
+            let bytes_after =
+                measure_pool_footprint(&env, &contract_id, pool_id, &tracked_users);
             let growth = bytes_after.saturating_sub(bytes_at_creation);
             cumulative_growth = growth;
             std::println!(
@@ -336,7 +342,7 @@ mod benchmark_tests {
         }
 
         // Sanity: storage should grow with each prediction
-        let final_bytes = measure_pool_footprint(&env, pool_id, &tracked_users);
+        let final_bytes = measure_pool_footprint(&env, &contract_id, pool_id, &tracked_users);
         assert!(
             final_bytes >= bytes_at_creation,
             "storage footprint should not shrink after predictions"
@@ -361,62 +367,247 @@ mod benchmark_tests {
     ///
     /// `tracked_users` is the list of users who have placed predictions on this pool;
     /// their per-user entries are included in the measurement.
-    fn measure_pool_footprint(env: &Env, pool_id: u64, tracked_users: &[Address]) -> usize {
-        let mut total: usize = 0;
+    fn measure_pool_footprint(
+        env: &Env,
+        contract_id: &Address,
+        pool_id: u64,
+        tracked_users: &[Address],
+    ) -> usize {
+        env.as_contract(contract_id, || {
+            let mut total: usize = 0;
 
-        // Pool struct
-        let pool_key = DataKey::Pool(pool_id);
-        let pool: Pool = env
-            .storage()
-            .persistent()
-            .get(&pool_key)
-            .expect("Pool must exist");
-        total += xdr::to_xdr(&pool_key).unwrap().len();
-        total += xdr::to_xdr(&pool).unwrap().len();
-
-        // Outcome stakes (OutStake entries)
-        for outcome in 0u32..pool.outcome_stakes.len() {
-            let stake_key = DataKey::OutStake(pool_id, outcome);
-            let stake: i128 = env
+            // Pool struct
+            let pool_key = DataKey::Pool(pool_id);
+            let pool: Pool = env
                 .storage()
                 .persistent()
-                .get(&stake_key)
-                .unwrap_or(0);
-            total += xdr::to_xdr(&stake_key).unwrap().len();
-            total += xdr::to_xdr(&stake).unwrap().len();
+                .get(&pool_key)
+                .expect("Pool must exist");
+            total += pool_key.to_xdr(env).len() as usize;
+            total += pool.to_xdr(env).len() as usize;
+
+            // Outcome stakes (batch `OutStakes` vector)
+            let stakes_key = DataKey::OutStakes(pool_id);
+            if let Some(stakes) = env.storage().persistent().get::<_, Vec<i128>>(&stakes_key) {
+                total += stakes_key.to_xdr(env).len() as usize;
+                total += stakes.to_xdr(env).len() as usize;
+            }
+
+            // Per-user prediction entries
+            for user in tracked_users {
+                // Prediction record
+                let pred_key = DataKey::Pred(user.clone(), pool_id);
+                if let Some(pred) = env.storage().persistent().get::<_, Prediction>(&pred_key) {
+                    total += pred_key.to_xdr(env).len() as usize;
+                    total += pred.to_xdr(env).len() as usize;
+                }
+
+                // Claimed sentinel
+                let claimed_key = DataKey::Claimed(user.clone(), pool_id);
+                if let Some(claimed) = env.storage().persistent().get::<_, bool>(&claimed_key) {
+                    total += claimed_key.to_xdr(env).len() as usize;
+                    total += claimed.to_xdr(env).len() as usize;
+                }
+
+                // Last prediction time (global, not per-pool)
+                let lpt_key = DataKey::LastPredictionTime(user.clone());
+                if let Some(lpt) = env.storage().persistent().get::<_, u64>(&lpt_key) {
+                    total += lpt_key.to_xdr(env).len() as usize;
+                    total += lpt.to_xdr(env).len() as usize;
+                }
+
+                // User prediction count
+                let cnt_key = DataKey::UsrPrdCnt(user.clone());
+                if let Some(cnt) = env.storage().persistent().get::<_, u32>(&cnt_key) {
+                    total += cnt_key.to_xdr(env).len() as usize;
+                    total += cnt.to_xdr(env).len() as usize;
+                }
+            }
+
+            total
+        })
+    }
+
+    /// Resource benchmarks at each contract-level limit.
+    ///
+    /// Reports the CPU, memory, and persistent-storage cost observed at the
+    /// configured ceiling and asserts that each remains below a published
+    /// ceiling. Run with:
+    /// ```bash
+    /// cargo test -p predifi-contract test_resource_ceilings_at_limits -- --nocapture
+    /// ```
+    #[test]
+    fn test_resource_ceilings_at_limits() {
+        const MAX_TX_CPU: u64 = 5_000_000; // 5% of Soroban's 100M instruction limit
+        const MAX_TX_MEM: u64 = 10 * 1024 * 1024; // 10 MB of the 40 MB test budget
+        // The 1,000th prediction measures ~30M CPU / ~15 MB, so keep the
+        // per-prediction ceiling at 40% / 50% of the host budget.
+        const MAX_PREDICTION_TX_CPU: u64 = 40_000_000;
+        const MAX_PREDICTION_TX_MEM: u64 = 20 * 1024 * 1024;
+        const MAX_POOL_BYTES: usize = 512 * 1024; // 512 KB of persistent state
+
+        let env = Env::default();
+        let (client, _admin, token_client, token_admin_client) = setup(&env);
+        let creator = Address::generate(&env);
+
+        // ── Outcome ceiling: create a pool at MAX_OUTCOMES_PER_POOL ────────
+        let outcomes = make_outcomes(&env, MAX_OUTCOMES_PER_POOL);
+        env.cost_estimate().budget().reset_default();
+        let pool_id = client.create_pool(
+            &creator,
+            &(env.ledger().timestamp() + 10000),
+            &token_client.address,
+            &MAX_OUTCOMES_PER_POOL,
+            &symbol_short!("Tech"),
+            &PoolConfig {
+                start_time: 0,
+                description: String::from_str(&env, "Resource ceiling"),
+                metadata_url: String::from_str(&env, "ipfs://resource-ceiling"),
+                min_stake: 1i128,
+                max_stake: 0,
+                max_total_stake: 0,
+                min_total_stake: 1,
+                initial_liquidity: 0,
+                required_resolutions: 1,
+                private: false,
+                whitelist_key: None,
+                outcome_descriptions: outcomes,
+            },
+        );
+        let create_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+        let create_mem = env.cost_estimate().budget().memory_bytes_cost();
+        let contract_id = client.address.clone();
+        env.cost_estimate().budget().reset_unlimited();
+        let outcome_bytes = measure_pool_footprint(&env, &contract_id, pool_id, &[]);
+        std::println!(
+            "[limits] outcomes={} create_cpu={} create_mem={} storage_bytes={}",
+            MAX_OUTCOMES_PER_POOL,
+            create_cpu,
+            create_mem,
+            outcome_bytes
+        );
+        assert!(create_cpu < MAX_TX_CPU, "create_pool CPU ceiling exceeded");
+        assert!(create_mem < MAX_TX_MEM, "create_pool memory ceiling exceeded");
+        assert!(
+            outcome_bytes < MAX_POOL_BYTES,
+            "outcome storage ceiling exceeded"
+        );
+
+        // ── Prediction ceiling: distinct predictors at the cap ────────────
+        let binary_outcomes = make_outcomes(&env, 2);
+        let binary_pool = client.create_pool(
+            &creator,
+            &(env.ledger().timestamp() + 10000),
+            &token_client.address,
+            &2u32,
+            &symbol_short!("Sports"),
+            &PoolConfig {
+                start_time: 0,
+                description: String::from_str(&env, "Prediction ceiling"),
+                metadata_url: String::from_str(&env, "ipfs://prediction-ceiling"),
+                min_stake: 1i128,
+                max_stake: 0,
+                max_total_stake: 0,
+                min_total_stake: 1,
+                initial_liquidity: 0,
+                required_resolutions: 1,
+                private: false,
+                whitelist_key: None,
+                outcome_descriptions: binary_outcomes,
+            },
+        );
+
+        let mut tracked_users = std::vec::Vec::with_capacity(MAX_PREDICTIONS_PER_POOL as usize);
+        let mut max_prediction_cpu = 0u64;
+        let mut max_prediction_mem = 0u64;
+        for i in 0..MAX_PREDICTIONS_PER_POOL {
+            let user = Address::generate(&env);
+            token_admin_client.mint(&user, &1i128);
+            env.cost_estimate().budget().reset_default();
+            client.place_prediction(&user, &binary_pool, &1i128, &0u32, &None, &None);
+            let cpu = env.cost_estimate().budget().cpu_instruction_cost();
+            let mem = env.cost_estimate().budget().memory_bytes_cost();
+            if i % 250 == 0 || i + 1 == MAX_PREDICTIONS_PER_POOL {
+                std::println!("[limits] prediction#{} cpu={} mem={}", i + 1, cpu, mem);
+            }
+            max_prediction_cpu = max_prediction_cpu.max(cpu);
+            max_prediction_mem = max_prediction_mem.max(mem);
+            tracked_users.push(user);
         }
+        // Storage measurement is a test-only scan; give it an unlimited budget
+        // so the accounting does not trip the per-transaction CPU limit.
+        env.cost_estimate().budget().reset_unlimited();
+        let prediction_bytes =
+            measure_pool_footprint(&env, &contract_id, binary_pool, &tracked_users);
+        std::println!(
+            "[limits] predictions={} max_prediction_cpu={} max_prediction_mem={} storage_bytes={}",
+            MAX_PREDICTIONS_PER_POOL,
+            max_prediction_cpu,
+            max_prediction_mem,
+            prediction_bytes
+        );
+        assert!(
+            max_prediction_cpu < MAX_PREDICTION_TX_CPU,
+            "place_prediction CPU ceiling exceeded"
+        );
+        assert!(
+            max_prediction_mem < MAX_PREDICTION_TX_MEM,
+            "place_prediction memory ceiling exceeded"
+        );
+        assert!(
+            prediction_bytes < MAX_POOL_BYTES,
+            "prediction storage ceiling exceeded"
+        );
 
-        // Per-user prediction entries
-        for user in tracked_users {
-            // Prediction record
-            let pred_key = DataKey::Pred(user.clone(), pool_id);
-            if let Some(pred) = env.storage().persistent().get(&pred_key) {
-                total += xdr::to_xdr(&pred_key).unwrap().len();
-                total += xdr::to_xdr(&pred).unwrap().len();
-            }
-
-            // Claimed sentinel
-            let claimed_key = DataKey::Claimed(user.clone(), pool_id);
-            if let Some(claimed) = env.storage().persistent().get(&claimed_key) {
-                total += xdr::to_xdr(&claimed_key).unwrap().len();
-                total += xdr::to_xdr(&claimed).unwrap().len();
-            }
-
-            // Last prediction time (global, not per-pool)
-            let lpt_key = DataKey::LastPredictionTime(user.clone());
-            if let Some(lpt) = env.storage().persistent().get(&lpt_key) {
-                total += xdr::to_xdr(&lpt_key).unwrap().len();
-                total += xdr::to_xdr(&lpt).unwrap().len();
-            }
-
-            // User prediction count
-            let cnt_key = DataKey::UsrPrdCnt(user.clone());
-            if let Some(cnt) = env.storage().persistent().get(&cnt_key) {
-                total += xdr::to_xdr(&cnt_key).unwrap().len();
-                total += xdr::to_xdr(&cnt).unwrap().len();
-            }
-        }
-
-        total
+        // ── Aggregate stake ceiling: single stake at the cap ──────────────
+        let aggregate_outcomes = make_outcomes(&env, 2);
+        let aggregate_pool = client.create_pool(
+            &creator,
+            &(env.ledger().timestamp() + 10000),
+            &token_client.address,
+            &2u32,
+            &symbol_short!("Finance"),
+            &PoolConfig {
+                start_time: 0,
+                description: String::from_str(&env, "Aggregate ceiling"),
+                metadata_url: String::from_str(&env, "ipfs://aggregate-ceiling"),
+                min_stake: 1i128,
+                max_stake: 0,
+                max_total_stake: 0,
+                min_total_stake: 1,
+                initial_liquidity: 0,
+                required_resolutions: 1,
+                private: false,
+                whitelist_key: None,
+                outcome_descriptions: aggregate_outcomes,
+            },
+        );
+        let whale = Address::generate(&env);
+        token_admin_client.mint(&whale, &MAX_AGGREGATE_STAKE_PER_POOL);
+        env.cost_estimate().budget().reset_default();
+        client.place_prediction(
+            &whale,
+            &aggregate_pool,
+            &MAX_AGGREGATE_STAKE_PER_POOL,
+            &0u32,
+            &None,
+            &None,
+        );
+        let aggregate_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+        let aggregate_mem = env.cost_estimate().budget().memory_bytes_cost();
+        std::println!(
+            "[limits] aggregate_stake={} place_cpu={} place_mem={}",
+            MAX_AGGREGATE_STAKE_PER_POOL, aggregate_cpu, aggregate_mem
+        );
+        // Measured after the pool state already holds 1,000 predictions, so
+        // this is the combined worst-case state for a max-size stake transfer.
+        assert!(
+            aggregate_cpu < MAX_PREDICTION_TX_CPU,
+            "aggregate stake CPU ceiling exceeded"
+        );
+        assert!(
+            aggregate_mem < MAX_PREDICTION_TX_MEM,
+            "aggregate stake memory ceiling exceeded"
+        );
     }
 }

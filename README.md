@@ -317,6 +317,12 @@ cargo test --workspace
 
 ---
 
+## Contract release policy
+
+See the [contract versioning and compatibility policy](docs/contract-versioning.md)
+for release versions, storage and client compatibility, artifact/deployment
+records, and a reproducible offline test release.
+
 ## 📄 License
 
 (MIT)[LICENSE]

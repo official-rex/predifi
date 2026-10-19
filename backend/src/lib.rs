@@ -14,6 +14,7 @@ pub mod jwt_security;
 pub mod metrics;
 pub mod migration_checks;
 pub mod notifications;
+pub mod outbox;
 pub mod openapi;
 pub mod pool_cache;
 pub mod price_cache;
