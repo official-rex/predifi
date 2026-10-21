@@ -3,7 +3,11 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tracing::instrument;
+
+// ── Query-group latency instrumentation ──────────────────────────────────────
 
 // ── Row / DTO types ───────────────────────────────────────────────────────────
 
@@ -16,6 +20,131 @@ pub struct PredictionHistoryRow {
     pub outcome: i32,
     pub amount: i64,
     pub created_at: DateTime<Utc>,
+}
+
+/// Coarse, low-cardinality query groups used for latency budgeting.
+///
+/// These are deliberately a small fixed set (never derived from user input,
+/// pool IDs, or addresses) so metrics stay bounded in cardinality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryGroup {
+    /// `get_user_prediction_history` / `get_user_predictions`.
+    PredictionHistory,
+    /// `get_market_predictions` / `count_market_predictions`.
+    MarketPredictions,
+    /// `get_users_by_betting_volume` / `get_users_by_winnings`.
+    LeaderboardAggregates,
+    /// `get_leaderboard_extended` / `explain_leaderboard_plan`.
+    LeaderboardExtended,
+    /// `get_protocol_stats`.
+    ProtocolStats,
+}
+
+impl QueryGroup {
+    /// Stable, low-cardinality label for metrics/benchmark output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QueryGroup::PredictionHistory => "prediction_history",
+            QueryGroup::MarketPredictions => "market_predictions",
+            QueryGroup::LeaderboardAggregates => "leaderboard_aggregates",
+            QueryGroup::LeaderboardExtended => "leaderboard_extended",
+            QueryGroup::ProtocolStats => "protocol_stats",
+        }
+    }
+}
+
+/// Documented latency + round-trip budgets for the core read paths.
+///
+/// Reference load: seeded Postgres + Redis, 1k pools, 100k predictions,
+/// 10k distinct users, warm caches, single-node CI runner. Budgets are p95
+/// wall-clock latency per query group and the number of DB round-trips the
+/// endpoint is expected to issue (so N+1 regressions surface as failures).
+#[derive(Debug, Clone, Copy)]
+pub struct ReadBudget {
+    pub group: QueryGroup,
+    /// p95 latency budget in milliseconds at the reference load.
+    pub p95_latency_ms: u64,
+    /// Expected number of DB round-trips for the endpoint/query group.
+    pub max_round_trips: u32,
+}
+
+/// The canonical budgets checked by the benchmark harness.
+pub const READ_BUDGETS: &[ReadBudget] = &[
+    ReadBudget { group: QueryGroup::PredictionHistory, p95_latency_ms: 50, max_round_trips: 1 },
+    ReadBudget { group: QueryGroup::MarketPredictions, p95_latency_ms: 30, max_round_trips: 2 },
+    ReadBudget { group: QueryGroup::LeaderboardAggregates, p95_latency_ms: 150, max_round_trips: 1 },
+    ReadBudget { group: QueryGroup::LeaderboardExtended, p95_latency_ms: 200, max_round_trips: 1 },
+    ReadBudget { group: QueryGroup::ProtocolStats, p95_latency_ms: 100, max_round_trips: 1 },
+];
+
+/// Look up the budget for a query group.
+pub fn budget_for(group: QueryGroup) -> &'static ReadBudget {
+    READ_BUDGETS
+        .iter()
+        .find(|b| b.group == group)
+        .expect("every QueryGroup has a documented budget")
+}
+
+/// Process-wide round-trip counter, keyed by query group index.
+///
+/// Used by the benchmark harness to assert the endpoint issues no more than
+/// its budgeted number of DB round-trips (catching accidental N+1 queries).
+static ROUND_TRIPS: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn group_index(group: QueryGroup) -> usize {
+    match group {
+        QueryGroup::PredictionHistory => 0,
+        QueryGroup::MarketPredictions => 1,
+        QueryGroup::LeaderboardAggregates => 2,
+        QueryGroup::LeaderboardExtended => 3,
+        QueryGroup::ProtocolStats => 4,
+    }
+}
+
+/// Snapshot the current round-trip count for a query group.
+pub fn round_trips(group: QueryGroup) -> u64 {
+    ROUND_TRIPS[group_index(group)].load(Ordering::Relaxed)
+}
+
+/// Reset the round-trip counter for a query group (benchmark setup).
+pub fn reset_round_trips(group: QueryGroup) {
+    ROUND_TRIPS[group_index(group)].store(0, Ordering::Relaxed);
+}
+
+/// Record one DB round-trip for a query group.
+fn record_round_trip(group: QueryGroup) {
+    ROUND_TRIPS[group_index(group)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Timer guard that records latency for a query group on drop.
+struct QueryTimer {
+    group: QueryGroup,
+    start: Instant,
+}
+
+impl QueryTimer {
+    fn start(group: QueryGroup) -> Self {
+        record_round_trip(group);
+        Self { group, start: Instant::now() }
+    }
+}
+
+impl Drop for QueryTimer {
+    fn drop(&mut self) {
+        let elapsed_ms = self.start.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            target: "db.latency",
+            query_group = self.group.as_str(),
+            latency_ms = elapsed_ms,
+            "query group latency"
+        );
+    }
 }
 
 /// Full prediction enriched with current pool status and win/loss resolution.
@@ -151,6 +280,7 @@ pub async fn get_user_prediction_history(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<PredictionHistoryRow>, sqlx::Error> {
+    let _timer = QueryTimer::start(QueryGroup::PredictionHistory);
     sqlx::query_as::<_, PredictionHistoryRow>(
         r#"
         SELECT
@@ -181,6 +311,7 @@ pub async fn get_user_predictions(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<UserPrediction>, sqlx::Error> {
+    let _timer = QueryTimer::start(QueryGroup::PredictionHistory);
     let rows = sqlx::query_as::<_, UserPredictionRow>(
         r#"
         SELECT
@@ -247,6 +378,7 @@ pub async fn get_market_predictions(
     after_id: Option<i64>,
     limit: i64,
 ) -> Result<Vec<MarketPredictionRow>, sqlx::Error> {
+    let _timer = QueryTimer::start(QueryGroup::MarketPredictions);
     sqlx::query_as::<_, MarketPredictionRow>(
         r#"
         SELECT id, pool_id, user_address, outcome, amount, created_at
@@ -266,6 +398,7 @@ pub async fn get_market_predictions(
 
 /// Total prediction count for a pool (used for the `total` response field).
 pub async fn count_market_predictions(pool: &PgPool, pool_id: i64) -> Result<i64, sqlx::Error> {
+    let _timer = QueryTimer::start(QueryGroup::MarketPredictions);
     let (count,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM predictions WHERE pool_id = $1")
             .bind(pool_id)
@@ -280,6 +413,7 @@ pub async fn get_users_by_betting_volume(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<UserBettingVolume>, sqlx::Error> {
+    let _timer = QueryTimer::start(QueryGroup::LeaderboardAggregates);
     let rows = sqlx::query_as::<_, UserVolumeRow>(
         r#"
         SELECT
@@ -318,6 +452,7 @@ pub async fn get_users_by_winnings(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<UserWinnings>, sqlx::Error> {
+    let _timer = QueryTimer::start(QueryGroup::LeaderboardAggregates);
     let rows = sqlx::query_as::<_, UserWinningsRow>(
         r#"
         WITH pool_winning_totals AS (
@@ -514,6 +649,7 @@ pub async fn get_leaderboard_extended(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<LeaderboardEntry>, sqlx::Error> {
+    let _timer = QueryTimer::start(QueryGroup::LeaderboardExtended);
     let cutoff = leaderboard_cutoff(period);
     let sql = leaderboard_sql(rank_by);
 
@@ -564,6 +700,7 @@ pub async fn explain_leaderboard_plan(
     limit: i64,
     offset: i64,
 ) -> Result<String, sqlx::Error> {
+    let _timer = QueryTimer::start(QueryGroup::LeaderboardExtended);
     let cutoff = leaderboard_cutoff(period);
     let sql = format!("EXPLAIN {}", leaderboard_sql(rank_by));
 
@@ -584,6 +721,7 @@ pub async fn get_protocol_stats(
     category: Option<&str>,
     state: Option<&str>,
 ) -> Result<ProtocolStats, sqlx::Error> {
+    let _timer = QueryTimer::start(QueryGroup::ProtocolStats);
     sqlx::query_as::<_, ProtocolStats>(
         r#"
         WITH filtered_pools AS (
@@ -743,5 +881,33 @@ mod tests {
         assert_eq!(100i64.clamp(1, 100), 100);
         assert_eq!(9_999i64.clamp(1, 100), 100);
         assert_eq!(50i64.clamp(1, 100), 50);
+    }
+
+    // ── Read budgets ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn every_query_group_has_a_budget() {
+        for group in [
+            QueryGroup::PredictionHistory,
+            QueryGroup::MarketPredictions,
+            QueryGroup::LeaderboardAggregates,
+            QueryGroup::LeaderboardExtended,
+            QueryGroup::ProtocolStats,
+        ] {
+            let budget = budget_for(group);
+            assert_eq!(budget.group, group);
+            assert!(budget.p95_latency_ms > 0);
+            assert!(budget.max_round_trips > 0);
+        }
+    }
+
+    #[test]
+    fn round_trip_counter_is_per_group() {
+        reset_round_trips(QueryGroup::MarketPredictions);
+        reset_round_trips(QueryGroup::ProtocolStats);
+        record_round_trip(QueryGroup::MarketPredictions);
+        record_round_trip(QueryGroup::MarketPredictions);
+        assert_eq!(round_trips(QueryGroup::MarketPredictions), 2);
+        assert_eq!(round_trips(QueryGroup::ProtocolStats), 0);
     }
 }

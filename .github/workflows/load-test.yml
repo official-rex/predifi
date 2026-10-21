@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: '0 2 * * 0' # Run every Sunday at 2:00 AM
   workflow_dispatch:    # Allow manual triggers from the UI
+  pull_request:
+    paths:
+      - 'backend/**'
 
 jobs:
   capacity-test:
@@ -53,12 +56,16 @@ jobs:
         run: |
           cargo build --release
           cargo run --bin predifi-seed -- --fresh
+          cargo run --release --bin predifi-seed -- --seed-load --pools 500 --predictions 50000
 
       - name: Start Backend Server
         env:
           DATABASE_URL: postgres://postgres:postgrespassword@localhost:5432/predifi_test
           REDIS_URL: redis://localhost:6379
           PREDIFI_DB_MAX_CONNECTIONS: 50
+          PREDIFI_PERF_BUDGETS: "config/perf-budgets.toml"
+          PREDIFI_REFERENCE_LOAD: "config/reference-load.toml"
+          RUST_LOG: "info,predifi=debug"
         run: |
           cargo run --release &
           sleep 5 # Wait for Axum to bind to port 3000
@@ -66,10 +73,45 @@ jobs:
       - name: Execute Load Test
         env:
           RUN_CAPACITY_TEST: "1"
-        run: cargo test --test load_tests -- --nocapture > capacity-test-results.txt
+          PERF_BUDGETS_PATH: "config/perf-budgets.toml"
+          PERF_REFERENCE_LOAD_PATH: "config/reference-load.toml"
+          PERF_REPORT_PATH: "capacity-test-results.txt"
+        run: |
+          cargo test --test load_tests -- --nocapture 2>&1 | tee capacity-test-results.txt
+          cargo run --release --bin predifi-perf-report -- \
+            --budgets config/perf-budgets.toml \
+            --reference-load config/reference-load.toml \
+            --results capacity-test-results.txt \
+            --output perf-report.json \
+            --fail-on-regression
 
       - name: Upload Results Artifact
         uses: actions/upload-artifact@v4
         with:
           name: capacity-test-results
-          path: backend/capacity-test-results.txt
+          path: |
+            backend/capacity-test-results.txt
+            backend/perf-report.json
+
+      - name: Comment Perf Budgets on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('backend/perf-report.json', 'utf8'));
+            const lines = ['### Performance Budget Report', ''];
+            for (const g of report.groups) {
+              const status = g.within_budget ? '✅' : '❌';
+              lines.push(`${status} **${g.name}** — p95 ${g.p95_ms}ms (budget ${g.p95_budget_ms}ms), db round-trips ${g.db_roundtrips} (budget ${g.db_roundtrips_budget})`);
+            }
+            if (report.regressions.length) {
+              lines.push('', '**Regressions detected:**');
+              for (const r of report.regressions) lines.push(`- ${r}`);
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: lines.join('\n'),
+            });

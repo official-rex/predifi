@@ -2,6 +2,7 @@ use prometheus::{
     CounterVec, Encoder, Gauge, Histogram, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Shared application metrics exposed to Prometheus.
 #[derive(Clone)]
@@ -72,6 +73,21 @@ pub struct Metrics {
     pub worker_queue_depth: Gauge,
     /// Current number of jobs in the worker dead-letter queue (DLQ).
     pub worker_dlq_depth: Gauge,
+
+    // ── Core read budgets ────────────────────────────────────────────────────
+    /// Histogram of end-to-end latency for core read endpoints, labelled by
+    /// `endpoint` (a small fixed set: "pool_list", "pool_detail",
+    /// "prediction_history").  Used to evaluate the p95 latency budget.
+    pub core_read_duration_seconds: HistogramVec,
+    /// Histogram of database round-trips per core read request, labelled by
+    /// `endpoint`.  Used to evaluate the query-count budget.
+    pub core_read_db_roundtrips: HistogramVec,
+    /// Counter of core read requests that exceeded the documented p95 latency
+    /// budget, labelled by `endpoint`.
+    pub core_read_latency_budget_exceeded_total: CounterVec,
+    /// Counter of core read requests that exceeded the documented query-count
+    /// budget, labelled by `endpoint`.
+    pub core_read_query_budget_exceeded_total: CounterVec,
 }
 
 /// Type alias for a reference-counted [`Metrics`] instance shared across handlers.
@@ -262,6 +278,50 @@ impl Metrics {
             "Current number of jobs in the worker dead-letter queue (DLQ).",
         ))?;
 
+        // ── Core read budgets ─────────────────────────────────────────────────
+        // Buckets are chosen so the documented p95 budgets (see
+        // `CoreReadBudget` below) fall on a bucket boundary, making
+        // `histogram_quantile(0.95, …)` comparisons meaningful.
+        let core_read_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "app_core_read_duration_seconds",
+                "End-to-end latency of core read endpoints in seconds, \
+                 labelled by endpoint.",
+            )
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0, 2.5, 5.0,
+            ]),
+            &["endpoint"],
+        )?;
+
+        let core_read_db_roundtrips = HistogramVec::new(
+            HistogramOpts::new(
+                "app_core_read_db_roundtrips",
+                "Number of database round-trips performed per core read request, \
+                 labelled by endpoint.",
+            )
+            .buckets(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0, 50.0]),
+            &["endpoint"],
+        )?;
+
+        let core_read_latency_budget_exceeded_total = CounterVec::new(
+            Opts::new(
+                "app_core_read_latency_budget_exceeded_total",
+                "Total core read requests that exceeded the documented p95 \
+                 latency budget, labelled by endpoint.",
+            ),
+            &["endpoint"],
+        )?;
+
+        let core_read_query_budget_exceeded_total = CounterVec::new(
+            Opts::new(
+                "app_core_read_query_budget_exceeded_total",
+                "Total core read requests that exceeded the documented \
+                 database round-trip budget, labelled by endpoint.",
+            ),
+            &["endpoint"],
+        )?;
+
         // ── Register all metrics ──────────────────────────────────────────────
         registry.register(Box::new(http_requests_total.clone()))?;
         registry.register(Box::new(http_request_duration_seconds.clone()))?;
@@ -288,6 +348,10 @@ impl Metrics {
         registry.register(Box::new(prediction_volume_stroops_total.clone()))?;
         registry.register(Box::new(worker_queue_depth.clone()))?;
         registry.register(Box::new(worker_dlq_depth.clone()))?;
+        registry.register(Box::new(core_read_duration_seconds.clone()))?;
+        registry.register(Box::new(core_read_db_roundtrips.clone()))?;
+        registry.register(Box::new(core_read_latency_budget_exceeded_total.clone()))?;
+        registry.register(Box::new(core_read_query_budget_exceeded_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -316,6 +380,10 @@ impl Metrics {
             prediction_volume_stroops_total,
             worker_queue_depth,
             worker_dlq_depth,
+            core_read_duration_seconds,
+            core_read_db_roundtrips,
+            core_read_latency_budget_exceeded_total,
+            core_read_query_budget_exceeded_total,
         })
     }
 
@@ -375,6 +443,36 @@ impl Metrics {
             .inc();
     }
 
+    /// Record the observed latency and database round-trip count for a single
+    /// core read request, and flag budget violations.
+    ///
+    /// `endpoint` must be one of the stable, low-cardinality labels defined on
+    /// [`CoreReadBudget`] (e.g. `"pool_list"`, `"pool_detail"`,
+    /// `"prediction_history"`).  `db_roundtrips` is the number of database
+    /// queries issued while serving the request.
+    pub fn record_core_read(&self, endpoint: &str, duration: Duration, db_roundtrips: u64) {
+        let duration_secs = duration.as_secs_f64();
+        self.core_read_duration_seconds
+            .with_label_values(&[endpoint])
+            .observe(duration_secs);
+        self.core_read_db_roundtrips
+            .with_label_values(&[endpoint])
+            .observe(db_roundtrips as f64);
+
+        if let Some(budget) = CoreReadBudget::for_endpoint(endpoint) {
+            if duration_secs > budget.p95_latency_secs {
+                self.core_read_latency_budget_exceeded_total
+                    .with_label_values(&[endpoint])
+                    .inc();
+            }
+            if db_roundtrips > budget.max_db_roundtrips {
+                self.core_read_query_budget_exceeded_total
+                    .with_label_values(&[endpoint])
+                    .inc();
+            }
+        }
+    }
+
     /// Increment the active WebSocket connection count (call on connect).
     pub fn ws_connect(&self) {
         self.ws_connections_active.inc();
@@ -425,6 +523,52 @@ impl Metrics {
             .map_err(|e| prometheus::Error::Msg(format!("failed to encode metrics: {e}")))?;
         String::from_utf8(buffer)
             .map_err(|e| prometheus::Error::Msg(format!("invalid metrics UTF-8: {e}")))
+    }
+}
+
+/// Documented performance budgets for core read endpoints.
+///
+/// These budgets are evaluated at the reference load described in
+/// `docs/perf-budgets.md` (seeded Postgres + Redis, 50 concurrent clients,
+/// 60 s steady state).  They are intentionally expressed as *p95 latency* and
+/// *max database round-trips per request* so that regressions surface in CI
+/// before they reach users.
+///
+/// The `endpoint` label is a small, fixed set — never derive it from a URL
+/// path or user input, to keep cardinality bounded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoreReadBudget {
+    /// Stable, low-cardinality endpoint label.
+    pub endpoint: &'static str,
+    /// p95 end-to-end latency budget in seconds at the reference load.
+    pub p95_latency_secs: f64,
+    /// Maximum number of database round-trips allowed per request.
+    pub max_db_roundtrips: u64,
+}
+
+impl CoreReadBudget {
+    /// All documented core read budgets.
+    pub const ALL: &'static [CoreReadBudget] = &[
+        CoreReadBudget {
+            endpoint: "pool_list",
+            p95_latency_secs: 0.150,
+            max_db_roundtrips: 3,
+        },
+        CoreReadBudget {
+            endpoint: "pool_detail",
+            p95_latency_secs: 0.100,
+            max_db_roundtrips: 4,
+        },
+        CoreReadBudget {
+            endpoint: "prediction_history",
+            p95_latency_secs: 0.200,
+            max_db_roundtrips: 3,
+        },
+    ];
+
+    /// Look up the budget for a given endpoint label, if one is documented.
+    pub fn for_endpoint(endpoint: &str) -> Option<&'static CoreReadBudget> {
+        Self::ALL.iter().find(|b| b.endpoint == endpoint)
     }
 }
 
@@ -696,5 +840,66 @@ mod tests {
         metrics.record_worker_queue_depth(12, 3);
         assert_eq!(metrics.worker_queue_depth.get(), 12.0);
         assert_eq!(metrics.worker_dlq_depth.get(), 3.0);
+    }
+
+    /// Every documented core read budget has a stable, non-empty label and
+    /// positive thresholds.
+    #[test]
+    fn core_read_budgets_are_well_formed() {
+        assert!(!CoreReadBudget::ALL.is_empty());
+        for budget in CoreReadBudget::ALL {
+            assert!(!budget.endpoint.is_empty());
+            assert!(budget.p95_latency_secs > 0.0);
+            assert!(budget.max_db_roundtrips > 0);
+        }
+    }
+
+    /// `for_endpoint` resolves documented labels and rejects unknown ones.
+    #[test]
+    fn core_read_budget_lookup() {
+        assert!(CoreReadBudget::for_endpoint("pool_list").is_some());
+        assert!(CoreReadBudget::for_endpoint("pool_detail").is_some());
+        assert!(CoreReadBudget::for_endpoint("prediction_history").is_some());
+        assert!(CoreReadBudget::for_endpoint("unknown").is_none());
+    }
+
+    /// `record_core_read` observes latency and round-trips, and flags
+    /// violations of both budgets.
+    #[test]
+    fn record_core_read_flags_budget_violations() {
+        let metrics = Metrics::new().expect("Metrics::new() must succeed");
+
+        // Within budget: no violation counters incremented.
+        metrics.record_core_read("pool_list", Duration::from_millis(50), 2);
+        let text = metrics.gather_text().expect("gather_text must succeed");
+        assert!(text.contains("app_core_read_duration_seconds"));
+        assert!(text.contains("app_core_read_db_roundtrips"));
+
+        // Over latency budget.
+        metrics.record_core_read("pool_list", Duration::from_millis(500), 2);
+        // Over query budget.
+        metrics.record_core_read("pool_list", Duration::from_millis(50), 10);
+
+        let text = metrics.gather_text().expect("gather_text must succeed");
+        assert!(
+            text.contains("app_core_read_latency_budget_exceeded_total"),
+            "latency budget violation counter must appear"
+        );
+        assert!(
+            text.contains("app_core_read_query_budget_exceeded_total"),
+            "query budget violation counter must appear"
+        );
+    }
+
+    /// Unknown endpoints are still observed but never flagged.
+    #[test]
+    fn record_core_read_unknown_endpoint_is_not_flagged() {
+        let metrics = Metrics::new().expect("Metrics::new() must succeed");
+        metrics.record_core_read("not_a_core_read", Duration::from_secs(10), 100);
+
+        let text = metrics.gather_text().expect("gather_text must succeed");
+        assert!(text.contains("app_core_read_duration_seconds"));
+        assert!(!text.contains("app_core_read_latency_budget_exceeded_total"));
+        assert!(!text.contains("app_core_read_query_budget_exceeded_total"));
     }
 }
